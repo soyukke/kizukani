@@ -1,0 +1,13 @@
+import std::gpu;
+
+export "gpu" fn add_residual(hidden: &var []f32, projected: []f32, width: i64) -> void {
+    let id = gpu::thread_index();
+    let token = id / width;
+    let index = id % width;
+    if token >= batch_capacity() {
+        return;
+    }
+    let at = token * hidden_stride() + index;
+    hidden[at] = round_to_bf16(hidden[at] + round_to_bf16(projected[token * slot_values() + index]));
+    return;
+}

@@ -1,0 +1,471 @@
+import kizukani::yskn;
+import std::array;
+import std::math;
+import std::mem;
+
+pub struct AttentionCache {
+    pub keys: array::Array<f32>,
+    pub values: array::Array<f32>,
+}
+
+pub struct DeltaNetState {
+    pub recurrent: array::Array<f32>,
+    pub history: array::Array<f32>,
+}
+
+pub struct DecodeState {
+    pub attention_caches: array::Array<AttentionCache>,
+    pub delta_net_states: array::Array<DeltaNetState>,
+}
+
+pub struct NormalizedInput {
+    pub activation: QuantizedActivation,
+    pub inverse_rms: f32,
+    pub weighted_hidden_bf16: array::Array<f32>,
+}
+
+pub fn attention_head_width() -> i64 {
+    return 256;
+}
+
+pub fn attention_query_heads() -> i64 {
+    return 24;
+}
+
+pub fn attention_key_value_heads() -> i64 {
+    return 4;
+}
+
+pub fn rotary_pairs() -> i64 {
+    return 32;
+}
+
+pub fn delta_net_head_width() -> i64 {
+    return 128;
+}
+
+pub fn delta_net_key_heads() -> i64 {
+    return 16;
+}
+
+pub fn delta_net_value_heads() -> i64 {
+    return 48;
+}
+
+pub fn delta_net_channels() -> i64 {
+    return 10240;
+}
+
+pub fn delta_net_history_rows() -> i64 {
+    return 3;
+}
+
+fn zeros(allocator: Allocator, count: i64) -> mem::Error!array::Array<f32> {
+    var values = array::new<f32>(allocator);
+    errdefer values.deinit(allocator);
+    try values.reserve(allocator, count);
+    for 0..count |index| {
+        try values.append(allocator, cast<f32>(0.0));
+    }
+    return move values;
+}
+
+pub fn new_decode_state(allocator: Allocator, weights: &ModelWeights) -> mem::Error!DecodeState {
+    var attention_caches = array::new<AttentionCache>(allocator);
+    errdefer attention_caches.deinit(allocator);
+    for 0..weights.attention_layers.len() |layer| {
+        try attention_caches.append(allocator, AttentionCache { keys: array::new<f32>(allocator), values: array::new<f32>(allocator) });
+    }
+    var delta_net_states = array::new<DeltaNetState>(allocator);
+    errdefer delta_net_states.deinit(allocator);
+    let state_width = delta_net_value_heads() * delta_net_head_width() * delta_net_head_width();
+    for 0..weights.delta_net_layers.len() |layer| {
+        var recurrent = try zeros(allocator, state_width);
+        errdefer recurrent.deinit(allocator);
+        let history = try zeros(allocator, delta_net_history_rows() * delta_net_channels());
+        try delta_net_states.append(allocator, DeltaNetState { recurrent: move recurrent, history: move history });
+    }
+    return DecodeState { attention_caches: move attention_caches, delta_net_states: move delta_net_states };
+}
+
+pub fn prepare_normalization(allocator: Allocator, hidden: []f32, norm_weight: []f32, signs: []i8) -> ProjectionError!NormalizedInput {
+    let width = mem::count<f32>(hidden);
+    let norm_argument = sum_of_squares_in_reference_order(hidden) / cast<f32>(width) + model_epsilon();
+    let inverse_rms = reciprocal_square_root(norm_argument);
+    var unnormalized = array::new<f32>(allocator);
+    defer unnormalized.deinit(allocator);
+    var weighted_hidden_bf16 = array::new<f32>(allocator);
+    errdefer weighted_hidden_bf16.deinit(allocator);
+    for 0..width |index| {
+        let adjusted = hidden[index] * (cast<f32>(1.0) + norm_weight[index]);
+        try unnormalized.append(allocator, adjusted);
+        try weighted_hidden_bf16.append(allocator, round_to_bf16(adjusted));
+    }
+    let unnormalized_view = unnormalized.as_slice();
+    let activation = try quantize_activation(allocator, unnormalized_view, signs);
+    return NormalizedInput { activation: move activation, inverse_rms: inverse_rms, weighted_hidden_bf16: move weighted_hidden_bf16 };
+}
+
+fn add_residual(hidden: &var []f32, projected: []f32) -> void {
+    for 0..mem::count<f32>(projected) |index| {
+        hidden[index] = round_to_bf16(hidden[index] + round_to_bf16(projected[index]));
+    }
+    return;
+}
+
+fn project_into(allocator: Allocator, projector: &var Projector, linear: &CompressedLinear, activation: &QuantizedActivation, inverse_rms: f32) -> ProjectionError!array::Array<f32> {
+    return try project(allocator, projector, linear, activation, inverse_rms);
+}
+
+fn project_unnormalized(allocator: Allocator, projector: &var Projector, linear: &CompressedLinear, input: []f32) -> ProjectionError!array::Array<f32> {
+    let signs = linear.input_signs.as_slice();
+    let activation = try quantize_activation(allocator, input, signs);
+    defer activation.deinit(allocator);
+    return try project_into(allocator, projector, linear, &activation, cast<f32>(1.0));
+}
+
+fn rope_frequency(pair: i64) -> f32 {
+    let bits = [32]u32{
+        0x3f800000, 0x3f1ab32b, 0x3ebaf81b, 0x3e61f835, 0x3e088d77, 0x3da50956, 0x3d47763f, 0x3cf11177,
+        0x3c91ad39, 0x3c301052, 0x3bd4ca15, 0x3b80967d, 0x3b1b690d, 0x3abbd3ed, 0x3a6301e2, 0x3a092e02,
+        0x39a5cb60, 0x394860c1, 0x38f22ce2, 0x3892587e, 0x3830df52, 0x37d5c441, 0x37812dab, 0x371c1fc4,
+        0x36bcb0c1, 0x36640cc6, 0x3609cf4a, 0x35a68e4c, 0x35494c57, 0x34f3499d, 0x3493048e, 0x3431af44,
+    };
+    let view = bits.as_slice();
+    return yskn::binary32_from_bits(view[pair]);
+}
+
+fn normalize_attention_head(values: &var []f32, first: i64, norm_weight: []f32) -> void {
+    var square_sum: f32 = 0.0;
+    var products = [32]f32{};
+    let product_view = products.as_mut_slice();
+    for 0..(attention_head_width() / 32) |group| {
+        for 0..32 |lane| {
+            let value = values[first + group * 32 + lane];
+            product_view[lane] = value * value;
+        }
+        square_sum = square_sum + xor_reduce_32(product_view, 0);
+    }
+    let inverse_rms = reciprocal_square_root(square_sum / cast<f32>(attention_head_width()) + model_epsilon());
+    for 0..attention_head_width() |channel| {
+        values[first + channel] = round_to_bf16((values[first + channel] * inverse_rms) * (cast<f32>(1.0) + norm_weight[channel]));
+    }
+    return;
+}
+
+fn apply_rotary(values: &var []f32, first: i64, position: i64) -> void {
+    let pairs = rotary_pairs();
+    for 0..pairs |pair| {
+        let angle = cast<f32>(position) * rope_frequency(pair);
+        let cosine = round_to_bf16(cast<f32>(math::cos<f64>(cast<f64>(angle))));
+        let sine = round_to_bf16(cast<f32>(math::sin<f64>(cast<f64>(angle))));
+        let low = values[first + pair];
+        let high = values[first + pair + pairs];
+        values[first + pair] = round_to_bf16(round_to_bf16(low * cosine) + round_to_bf16(-high * sine));
+        values[first + pair + pairs] = round_to_bf16(round_to_bf16(high * cosine) + round_to_bf16(low * sine));
+    }
+    return;
+}
+
+fn attention_step(allocator: Allocator, projector: &var Projector, weights: &AttentionWeights, cache: &var AttentionCache, input: &NormalizedInput, position: i64) -> ProjectionError!array::Array<f32> {
+    let head_width = attention_head_width();
+    var projected = try project_triple(allocator, projector, &weights.query_and_gate, &weights.key, &weights.value, &input.activation, input.inverse_rms);
+    defer projected.deinit(allocator);
+
+    var key_view = projected.second.as_mut_slice();
+    let value_view = projected.third.as_slice();
+    let key_norm = weights.key_norm.as_slice();
+    for 0..attention_key_value_heads() |head| {
+        let first = head * head_width;
+        for 0..head_width |channel| {
+            key_view[first + channel] = round_to_bf16(key_view[first + channel]);
+        }
+        normalize_attention_head(&var key_view, first, key_norm);
+        apply_rotary(&var key_view, first, position);
+        for 0..head_width |channel| {
+            try cache.keys.append(allocator, key_view[first + channel]);
+            try cache.values.append(allocator, round_to_bf16(value_view[first + channel]));
+        }
+    }
+
+    let positions = position + 1;
+    let cached_keys = cache.keys.as_slice();
+    let cached_values = cache.values.as_slice();
+    let row_width = attention_key_value_heads() * head_width;
+    var query_view = projected.first.as_mut_slice();
+    let query_norm = weights.query_norm.as_slice();
+    var gated = try zeros(allocator, attention_query_heads() * head_width);
+    defer gated.deinit(allocator);
+    var gated_view = gated.as_mut_slice();
+    var scores = try zeros(allocator, positions);
+    defer scores.deinit(allocator);
+    var score_view = scores.as_mut_slice();
+    var accumulated = [256]f32{};
+    let accumulated_view = accumulated.as_mut_slice();
+    for 0..attention_query_heads() |head| {
+        let query_first = 2 * head * head_width;
+        let gate_first = query_first + head_width;
+        for 0..head_width |channel| {
+            query_view[query_first + channel] = round_to_bf16(query_view[query_first + channel]);
+        }
+        normalize_attention_head(&var query_view, query_first, query_norm);
+        apply_rotary(&var query_view, query_first, position);
+        let key_value_head = head / (attention_query_heads() / attention_key_value_heads());
+        var maximum_score: f32 = cast<f32>(-1.0e30);
+        for 0..positions |past| {
+            let key_first = past * row_width + key_value_head * head_width;
+            var dot: f32 = 0.0;
+            for 0..head_width |channel| {
+                dot = dot + query_view[query_first + channel] * cached_keys[key_first + channel];
+            }
+            let score = dot * cast<f32>(0.0625);
+            score_view[past] = score;
+            if score > maximum_score {
+                maximum_score = score;
+            }
+        }
+        var weight_sum: f32 = 0.0;
+        for 0..head_width |channel| {
+            accumulated_view[channel] = 0.0;
+        }
+        for 0..positions |past| {
+            let weight = exponential(score_view[past] - maximum_score);
+            weight_sum = weight_sum + weight;
+            let value_first = past * row_width + key_value_head * head_width;
+            for 0..head_width |channel| {
+                accumulated_view[channel] = accumulated_view[channel] + weight * cached_values[value_first + channel];
+            }
+        }
+        for 0..head_width |channel| {
+            let attended = round_to_bf16(accumulated_view[channel] / weight_sum);
+            let gate = round_to_bf16(sigmoid(round_to_bf16(query_view[gate_first + channel])));
+            gated_view[head * head_width + channel] = round_to_bf16(attended * gate);
+        }
+    }
+    let gated_input = gated.as_slice();
+    return try project_unnormalized(allocator, projector, &weights.output, gated_input);
+}
+
+fn sum_of_four_32_term_sums(partial: []f32) -> f32 {
+    return ((partial[0] + partial[1]) + partial[2]) + partial[3];
+}
+
+fn delta_net_square_sum(values: []f32, first: i64) -> f32 {
+    var total: f32 = 0.0;
+    for 0..delta_net_head_width() |channel| {
+        let value = values[first + channel];
+        total = total + value * value;
+    }
+    return total;
+}
+
+fn dense_gate(rows: []f32, head: i64, weighted_hidden_bf16: []f32, inverse_rms: f32) -> f32 {
+    let width = mem::count<f32>(weighted_hidden_bf16);
+    var dot: f32 = 0.0;
+    for 0..width |index| {
+        dot = dot + rows[head * width + index] * weighted_hidden_bf16[index];
+    }
+    return round_to_bf16(dot * inverse_rms);
+}
+
+fn delta_net_step(allocator: Allocator, projector: &var Projector, weights: &DeltaNetWeights, state: &var DeltaNetState, input: &NormalizedInput) -> ProjectionError!array::Array<f32> {
+    let channels = delta_net_channels();
+    let head_width = delta_net_head_width();
+    let key_width = delta_net_key_heads() * head_width;
+    var projected_pair = try project_pair(allocator, projector, &weights.query_key_value, &weights.output_gate, &input.activation, input.inverse_rms);
+    defer projected_pair.deinit(allocator);
+    var projected_view = projected_pair.first.as_mut_slice();
+    var z_view = projected_pair.second.as_mut_slice();
+    for 0..channels |channel| {
+        projected_view[channel] = round_to_bf16(projected_view[channel]);
+    }
+    for 0..mem::count<f32>(z_view) |channel| {
+        z_view[channel] = round_to_bf16(z_view[channel]);
+    }
+
+    var convolved = try zeros(allocator, channels);
+    defer convolved.deinit(allocator);
+    var convolved_view = convolved.as_mut_slice();
+    let convolution = weights.convolution.as_slice();
+    var history_view = state.history.as_mut_slice();
+    for 0..channels |channel| {
+        var value = convolution[channel * 4] * history_view[channel];
+        value = value + convolution[channel * 4 + 1] * history_view[channels + channel];
+        value = value + convolution[channel * 4 + 2] * history_view[2 * channels + channel];
+        value = value + convolution[channel * 4 + 3] * projected_view[channel];
+        convolved_view[channel] = round_to_bf16(silu(round_to_bf16(value)));
+    }
+    for 0..channels |channel| {
+        history_view[channel] = history_view[channels + channel];
+        history_view[channels + channel] = history_view[2 * channels + channel];
+        history_view[2 * channels + channel] = projected_view[channel];
+    }
+
+    var queries = try zeros(allocator, key_width);
+    defer queries.deinit(allocator);
+    var query_view = queries.as_mut_slice();
+    var keys = try zeros(allocator, key_width);
+    defer keys.deinit(allocator);
+    var key_view = keys.as_mut_slice();
+    for 0..delta_net_key_heads() |head| {
+        let first = head * head_width;
+        let query_inverse_length = reciprocal_square_root(delta_net_square_sum(convolved_view, first) + cast<f32>(0.000001));
+        let key_inverse_length = reciprocal_square_root(delta_net_square_sum(convolved_view, key_width + first) + cast<f32>(0.000001));
+        for 0..head_width |channel| {
+            query_view[first + channel] = (convolved_view[first + channel] * query_inverse_length) * cast<f32>(0.088388346);
+            key_view[first + channel] = convolved_view[key_width + first + channel] * key_inverse_length;
+        }
+    }
+
+    let decay_rows = weights.decay_gate_rows.as_slice();
+    let update_rows = weights.update_gate_rows.as_slice();
+    let hidden_bf16 = input.weighted_hidden_bf16.as_slice();
+    let log_decay = weights.log_decay.as_slice();
+    let time_bias = weights.time_bias.as_slice();
+    let output_norm = weights.output_norm.as_slice();
+    var recurrent_view = state.recurrent.as_mut_slice();
+    var gated = try zeros(allocator, delta_net_value_heads() * head_width);
+    defer gated.deinit(allocator);
+    var gated_view = gated.as_mut_slice();
+    var core = [128]f32{};
+    let core_view = core.as_mut_slice();
+    var partial = [4]f32{};
+    let partial_view = partial.as_mut_slice();
+    let value_heads_per_key_head = delta_net_value_heads() / delta_net_key_heads();
+    for 0..delta_net_value_heads() |value_head| {
+        let key_first = (value_head / value_heads_per_key_head) * head_width;
+        let value_first = 2 * key_width + value_head * head_width;
+        let state_first = value_head * head_width * head_width;
+        let update_gate = round_to_bf16(sigmoid(dense_gate(update_rows, value_head, hidden_bf16, input.inverse_rms)));
+        let decay_input = dense_gate(decay_rows, value_head, hidden_bf16, input.inverse_rms) + time_bias[value_head];
+        let decay = exponential(-exponential(log_decay[value_head]) * softplus(decay_input));
+        for 0..head_width |value_channel| {
+            for 0..4 |group| {
+                var sum: f32 = 0.0;
+                for 0..32 |offset| {
+                    let key_channel = group * 32 + offset;
+                    let index = state_first + key_channel * head_width + value_channel;
+                    recurrent_view[index] = recurrent_view[index] * decay;
+                    sum = sum + recurrent_view[index] * key_view[key_first + key_channel];
+                }
+                partial_view[group] = sum;
+            }
+            let prediction = sum_of_four_32_term_sums(partial_view);
+            let correction = (convolved_view[value_first + value_channel] - prediction) * update_gate;
+            for 0..4 |group| {
+                var sum: f32 = 0.0;
+                for 0..32 |offset| {
+                    let key_channel = group * 32 + offset;
+                    let index = state_first + key_channel * head_width + value_channel;
+                    recurrent_view[index] = recurrent_view[index] + key_view[key_first + key_channel] * correction;
+                    sum = sum + recurrent_view[index] * query_view[key_first + key_channel];
+                }
+                partial_view[group] = sum;
+            }
+            core_view[value_channel] = round_to_bf16(sum_of_four_32_term_sums(partial_view));
+        }
+        let inverse_rms = reciprocal_square_root(delta_net_square_sum(core_view, 0) / cast<f32>(head_width) + model_epsilon());
+        for 0..head_width |channel| {
+            let normalized = round_to_bf16(output_norm[channel] * round_to_bf16(core_view[channel] * inverse_rms));
+            gated_view[value_head * head_width + channel] = round_to_bf16(normalized * silu(z_view[value_head * head_width + channel]));
+        }
+    }
+    let gated_input = gated.as_slice();
+    return try project_unnormalized(allocator, projector, &weights.output, gated_input);
+}
+
+fn feed_forward_step(allocator: Allocator, projector: &var Projector, weights: &FeedForwardWeights, hidden: &var []f32) -> ProjectionError!void {
+    let hidden_view = hidden.*;
+    let norm = weights.post_mixer_norm.as_slice();
+    let signs = weights.gate.input_signs.as_slice();
+    let input = try prepare_normalization(allocator, hidden_view, norm, signs);
+    defer input.deinit(allocator);
+    var gate_and_up = try project_pair(allocator, projector, &weights.gate, &weights.up, &input.activation, input.inverse_rms);
+    defer gate_and_up.deinit(allocator);
+    var gate_view = gate_and_up.first.as_mut_slice();
+    let up_view = gate_and_up.second.as_slice();
+    for 0..mem::count<f32>(gate_view) |index| {
+        let rounded_gate = round_to_bf16(gate_view[index]);
+        let activation = round_to_bf16(silu(rounded_gate));
+        gate_view[index] = round_to_bf16(activation * round_to_bf16(up_view[index]));
+    }
+    let product = gate_and_up.first.as_slice();
+    let down = try project_unnormalized(allocator, projector, &weights.down, product);
+    defer down.deinit(allocator);
+    let down_view = down.as_slice();
+    add_residual(hidden, down_view);
+    return;
+}
+
+pub fn embed_token(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &ModelWeights, token: i64) -> ProjectionError!array::Array<f32> {
+    var hidden = try zeros(allocator, weights.hidden_width);
+    errdefer hidden.deinit(allocator);
+    var hidden_view = hidden.as_mut_slice();
+    if header.tensors.at(weights.embedding_tensor_index) |record| {
+        yskn::fill_rotated_row(file, record, token, &var hidden_view);
+    }
+    let signs = weights.embedding_input_signs.as_slice();
+    var block_start: i64 = 0;
+    while block_start < weights.hidden_width {
+        unnormalized_hadamard_in_place(&var hidden_view, block_start);
+        for 0..512 |offset| {
+            let index = block_start + offset;
+            hidden_view[index] = round_to_bf16((hidden_view[index] * inverse_sqrt_hadamard_width()) * cast<f32>(signs[index]));
+        }
+        block_start = block_start + 512;
+    }
+    return move hidden;
+}
+
+pub fn forward_token(allocator: Allocator, projector: &var Projector, file: []u8, header: &yskn::ContainerHeader, weights: &ModelWeights, state: &var DecodeState, token: i64, position: i64) -> ProjectionError!array::Array<f32> {
+    var hidden = try embed_token(allocator, file, header, weights, token);
+    defer hidden.deinit(allocator);
+    var hidden_view = hidden.as_mut_slice();
+    for 0..weights.layer_count |layer| {
+        let mixer_index = weights.layer_mixer_index.get_or_panic(layer);
+        if weights.feed_forward_layers.at(layer) |feed_forward| {
+            let input_norm = feed_forward.input_norm.as_slice();
+            if weights.layer_is_attention.get_or_panic(layer) {
+                if weights.attention_layers.at(mixer_index) |attention| {
+                    let signs = attention.query_and_gate.input_signs.as_slice();
+                    let input = try prepare_normalization(allocator, hidden_view, input_norm, signs);
+                    defer input.deinit(allocator);
+                    if state.attention_caches.at_mut(mixer_index) |cache| {
+                        let mixed = try attention_step(allocator, projector, attention, cache, &input, position);
+                        defer mixed.deinit(allocator);
+                        let mixed_view = mixed.as_slice();
+                        add_residual(&var hidden_view, mixed_view);
+                    }
+                }
+            } else {
+                if weights.delta_net_layers.at(mixer_index) |delta_net| {
+                    let signs = delta_net.query_key_value.input_signs.as_slice();
+                    let input = try prepare_normalization(allocator, hidden_view, input_norm, signs);
+                    defer input.deinit(allocator);
+                    if state.delta_net_states.at_mut(mixer_index) |delta_state| {
+                        let mixed = try delta_net_step(allocator, projector, delta_net, delta_state, &input);
+                        defer mixed.deinit(allocator);
+                        let mixed_view = mixed.as_slice();
+                        add_residual(&var hidden_view, mixed_view);
+                    }
+                }
+            }
+            try feed_forward_step(allocator, projector, feed_forward, &var hidden_view);
+        }
+    }
+    let final_norm = weights.final_norm.as_slice();
+    let head_signs = weights.output_head.input_signs.as_slice();
+    let input = try prepare_normalization(allocator, hidden_view, final_norm, head_signs);
+    defer input.deinit(allocator);
+    return try project_into(allocator, projector, &weights.output_head, &input.activation, input.inverse_rms);
+}
+
+pub fn greedy_token(logits: []f32) -> i64 {
+    var best: i64 = 0;
+    for 1..mem::count<f32>(logits) |token| {
+        if logits[token] > logits[best] {
+            best = token;
+        }
+    }
+    return best;
+}

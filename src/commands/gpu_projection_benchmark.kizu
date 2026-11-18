@@ -1,0 +1,141 @@
+import kizukani::mapped;
+import kizukani::model;
+import kizukani::yskn;
+import std::array;
+import std::mem;
+import std::rand;
+
+fn measure_linear(allocator: Allocator, gpu: &model::GpuLinearSums, file: []u8, file_address: u64, header: &yskn::ContainerHeader, name: []u8, rounds: i64) -> !void {
+    let index = yskn::find_tensor(header, name) orelse return model::ModelError::MissingTensor;
+    if header.tensors.at(index) |tensor| {
+        let linear = try model::load_compressed_linear(allocator, file, file_address, tensor);
+        defer linear.deinit(allocator);
+        var random = rand::new(3);
+        var input = array::new<f32>(allocator);
+        defer input.deinit(allocator);
+        for 0..linear.cols |col| {
+            try input.append(allocator, cast<f32>(random.below(2001) - 1000) / cast<f32>(1000.0));
+        }
+        let input_view = input.as_slice();
+        let signs = linear.input_signs.as_slice();
+        let activation = try model::quantize_activation(allocator, input_view, signs);
+        defer activation.deinit(allocator);
+        var best_seconds: f64 = 1.0e9;
+        for 0..rounds |round| {
+            let pass = try gpu.begin_shared_activation_pass(&activation);
+            gpu.encode_row_sums(&pass, 0, &linear);
+            let seconds = try pass.finish_and_measure_gpu_seconds();
+            if seconds < best_seconds {
+                best_seconds = seconds;
+            }
+        }
+        let code_bytes = cast<f64>(linear.code_word_count * 4);
+        print(name);
+        print("best microseconds, GB/s:");
+        print(cast<i64>(best_seconds * 1000000.0));
+        print(cast<i64>(code_bytes / best_seconds / 1000000000.0));
+    }
+    return;
+}
+
+pub fn run_gpu_projection_benchmark() -> !void {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(model_path());
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    // SAFETY: the mapping outlives gpu, which is released first.
+    let gpu = try unsafe model::open_gpu_linear_sums(allocator, file_address, cast<u64>(mapping.length()));
+    defer gpu.deinit(allocator);
+    try measure_linear(allocator, &gpu, file, file_address, &header, "layers.0.mlp.gate_proj", 20);
+    try measure_linear(allocator, &gpu, file, file_address, &header, "layers.0.mlp.down_proj", 20);
+    try measure_linear(allocator, &gpu, file, file_address, &header, "layers.0.linear_attn.in_proj_qkv", 20);
+    try measure_linear(allocator, &gpu, file, file_address, &header, "layers.3.self_attn.k_proj", 20);
+    try measure_linear(allocator, &gpu, file, file_address, &header, "lm_head", 20);
+    return;
+}
+
+fn sorted_middle(values: &var []f64) -> f64 {
+    let count = mem::count<f64>(values.*);
+    for 1..count |index| {
+        let value = values[index];
+        var at = index;
+        while at > 0 and values[at - 1] > value {
+            values[at] = values[at - 1];
+            at = at - 1;
+        }
+        values[at] = value;
+    }
+    return values[count / 2];
+}
+
+fn compare_linear(allocator: Allocator, first: &model::GpuLinearSums, second: &model::GpuLinearSums, file: []u8, file_address: u64, header: &yskn::ContainerHeader, name: []u8, rounds: i64) -> !void {
+    let index = yskn::find_tensor(header, name) orelse return model::ModelError::MissingTensor;
+    if header.tensors.at(index) |tensor| {
+        let linear = try model::load_compressed_linear(allocator, file, file_address, tensor);
+        defer linear.deinit(allocator);
+        var random = rand::new(3);
+        var input = array::new<f32>(allocator);
+        defer input.deinit(allocator);
+        for 0..linear.cols |col| {
+            try input.append(allocator, cast<f32>(random.below(2001) - 1000) / cast<f32>(1000.0));
+        }
+        let input_view = input.as_slice();
+        let signs = linear.input_signs.as_slice();
+        let activation = try model::quantize_activation(allocator, input_view, signs);
+        defer activation.deinit(allocator);
+        var ratios = array::new<f64>(allocator);
+        defer ratios.deinit(allocator);
+        var best_first: f64 = 1.0e9;
+        var best_second: f64 = 1.0e9;
+        for 0..rounds |round| {
+            let first_pass = try first.begin_shared_activation_pass(&activation);
+            first.encode_row_sums(&first_pass, 0, &linear);
+            let first_seconds = try first_pass.finish_and_measure_gpu_seconds();
+            let second_pass = try second.begin_shared_activation_pass(&activation);
+            second.encode_row_sums(&second_pass, 0, &linear);
+            let second_seconds = try second_pass.finish_and_measure_gpu_seconds();
+            if first_seconds < best_first {
+                best_first = first_seconds;
+            }
+            if second_seconds < best_second {
+                best_second = second_seconds;
+            }
+            try ratios.append(allocator, second_seconds / first_seconds);
+        }
+        var ratio_view = ratios.as_mut_slice();
+        print(name);
+        print(linear.bits_per_step);
+        print("best microseconds first, second, median second/first x1000:");
+        print(cast<i64>(best_first * 1000000.0));
+        print(cast<i64>(best_second * 1000000.0));
+        print(cast<i64>(sorted_middle(&var ratio_view) * 1000.0));
+    }
+    return;
+}
+
+pub fn run_row_sums_comparison(first_path: []u8, second_path: []u8, first_simdgroups: i64, second_simdgroups: i64, rounds: i64) -> !void {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(model_path());
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    // SAFETY: the mapping outlives both, which are released first.
+    let first = try unsafe model::open_gpu_linear_sums_from(allocator, first_path, first_simdgroups, file_address, cast<u64>(mapping.length()));
+    defer first.deinit(allocator);
+    // SAFETY: as above.
+    let second = try unsafe model::open_gpu_linear_sums_from(allocator, second_path, second_simdgroups, file_address, cast<u64>(mapping.length()));
+    defer second.deinit(allocator);
+    try compare_linear(allocator, &first, &second, file, file_address, &header, "layers.0.mlp.gate_proj", rounds);
+    try compare_linear(allocator, &first, &second, file, file_address, &header, "layers.0.mlp.down_proj", rounds);
+    try compare_linear(allocator, &first, &second, file, file_address, &header, "lm_head", rounds);
+    return;
+}

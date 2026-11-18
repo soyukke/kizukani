@@ -1,0 +1,241 @@
+import kizukani::yskn;
+import std::array;
+import std::mem;
+import std::string;
+
+pub struct AttentionWeights {
+    pub query_and_gate: CompressedLinear,
+    pub key: CompressedLinear,
+    pub value: CompressedLinear,
+    pub output: CompressedLinear,
+    pub query_norm: array::Array<f32>,
+    pub key_norm: array::Array<f32>,
+}
+
+pub struct DeltaNetWeights {
+    pub query_key_value: CompressedLinear,
+    pub output_gate: CompressedLinear,
+    pub output: CompressedLinear,
+    pub decay_gate_rows: array::Array<f32>,
+    pub update_gate_rows: array::Array<f32>,
+    pub convolution: array::Array<f32>,
+    pub log_decay: array::Array<f32>,
+    pub time_bias: array::Array<f32>,
+    pub output_norm: array::Array<f32>,
+}
+
+pub struct FeedForwardWeights {
+    pub input_norm: array::Array<f32>,
+    pub post_mixer_norm: array::Array<f32>,
+    pub gate: CompressedLinear,
+    pub up: CompressedLinear,
+    pub down: CompressedLinear,
+}
+
+pub struct ModelWeights {
+    pub layer_count: i64,
+    pub hidden_width: i64,
+    pub vocabulary_size: i64,
+    pub layer_is_attention: array::Array<bool>,
+    pub layer_mixer_index: array::Array<i64>,
+    pub attention_layers: array::Array<AttentionWeights>,
+    pub delta_net_layers: array::Array<DeltaNetWeights>,
+    pub feed_forward_layers: array::Array<FeedForwardWeights>,
+    pub final_norm: array::Array<f32>,
+    pub output_head: CompressedLinear,
+    pub embedding_tensor_index: i64,
+    pub embedding_input_signs: array::Array<i8>,
+}
+
+pub fn model_epsilon() -> f32 {
+    return cast<f32>(0.000001);
+}
+
+fn append_decimal(allocator: Allocator, out: &var string::String, value: i64) -> mem::Error!void {
+    if value >= 10 {
+        try append_decimal(allocator, out, value / 10);
+    }
+    try out.append_byte(allocator, cast<u8>(48 + value % 10));
+    return;
+}
+
+fn layer_tensor_name(allocator: Allocator, layer: i64, suffix: []u8) -> mem::Error!string::String {
+    var name = string::new(allocator);
+    errdefer name.deinit(allocator);
+    try name.append_bytes(allocator, "layers.");
+    try append_decimal(allocator, &var name, layer);
+    try name.append_byte(allocator, 46);
+    try name.append_bytes(allocator, suffix);
+    return move name;
+}
+
+fn load_vector_named(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, name: []u8) -> ProjectionError!array::Array<f32> {
+    let index = yskn::find_vector(header, name) orelse return ModelError::MissingVector;
+    var values = array::new<f32>(allocator);
+    errdefer values.deinit(allocator);
+    if header.vectors.at(index) |record| {
+        for 0..record.count |element| {
+            try values.append(allocator, yskn::vector_value(file, record, element));
+        }
+    }
+    return move values;
+}
+
+fn load_linear_named(allocator: Allocator, file: []u8, file_address: u64, header: &yskn::ContainerHeader, name: []u8) -> ProjectionError!CompressedLinear {
+    let index = yskn::find_tensor(header, name) orelse return ModelError::MissingTensor;
+    if header.tensors.at(index) |record| {
+        return try load_compressed_linear(allocator, file, file_address, record);
+    }
+    return ModelError::MissingTensor;
+}
+
+fn load_layer_vector(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, layer: i64, suffix: []u8) -> ProjectionError!array::Array<f32> {
+    let name = try layer_tensor_name(allocator, layer, suffix);
+    defer name.deinit(allocator);
+    let name_bytes = name.as_bytes();
+    return try load_vector_named(allocator, file, header, name_bytes);
+}
+
+fn load_layer_linear(allocator: Allocator, file: []u8, file_address: u64, header: &yskn::ContainerHeader, layer: i64, suffix: []u8) -> ProjectionError!CompressedLinear {
+    let name = try layer_tensor_name(allocator, layer, suffix);
+    defer name.deinit(allocator);
+    let name_bytes = name.as_bytes();
+    return try load_linear_named(allocator, file, file_address, header, name_bytes);
+}
+
+fn layer_has_tensor(allocator: Allocator, header: &yskn::ContainerHeader, layer: i64, suffix: []u8) -> mem::Error!bool {
+    let name = try layer_tensor_name(allocator, layer, suffix);
+    defer name.deinit(allocator);
+    let name_bytes = name.as_bytes();
+    if yskn::find_tensor(header, name_bytes) |index| {
+        return true;
+    }
+    return false;
+}
+
+fn load_attention(allocator: Allocator, file: []u8, file_address: u64, header: &yskn::ContainerHeader, layer: i64) -> ProjectionError!AttentionWeights {
+    var query_and_gate = try load_layer_linear(allocator, file, file_address, header, layer, "self_attn.q_proj");
+    errdefer query_and_gate.deinit(allocator);
+    var key = try load_layer_linear(allocator, file, file_address, header, layer, "self_attn.k_proj");
+    errdefer key.deinit(allocator);
+    var value = try load_layer_linear(allocator, file, file_address, header, layer, "self_attn.v_proj");
+    errdefer value.deinit(allocator);
+    var output = try load_layer_linear(allocator, file, file_address, header, layer, "self_attn.o_proj");
+    errdefer output.deinit(allocator);
+    var query_norm = try load_layer_vector(allocator, file, header, layer, "self_attn.q_norm");
+    errdefer query_norm.deinit(allocator);
+    let key_norm = try load_layer_vector(allocator, file, header, layer, "self_attn.k_norm");
+    return AttentionWeights {
+        query_and_gate: move query_and_gate,
+        key: move key,
+        value: move value,
+        output: move output,
+        query_norm: move query_norm,
+        key_norm: move key_norm,
+    };
+}
+
+fn load_delta_net(allocator: Allocator, file: []u8, file_address: u64, header: &yskn::ContainerHeader, layer: i64) -> ProjectionError!DeltaNetWeights {
+    var query_key_value = try load_layer_linear(allocator, file, file_address, header, layer, "linear_attn.in_proj_qkv");
+    errdefer query_key_value.deinit(allocator);
+    var output_gate = try load_layer_linear(allocator, file, file_address, header, layer, "linear_attn.in_proj_z");
+    errdefer output_gate.deinit(allocator);
+    var output = try load_layer_linear(allocator, file, file_address, header, layer, "linear_attn.out_proj");
+    errdefer output.deinit(allocator);
+    var decay_gate_rows = try load_layer_vector(allocator, file, header, layer, "linear_attn.in_proj_a");
+    errdefer decay_gate_rows.deinit(allocator);
+    var update_gate_rows = try load_layer_vector(allocator, file, header, layer, "linear_attn.in_proj_b");
+    errdefer update_gate_rows.deinit(allocator);
+    var convolution = try load_layer_vector(allocator, file, header, layer, "linear_attn.conv1d");
+    errdefer convolution.deinit(allocator);
+    var log_decay = try load_layer_vector(allocator, file, header, layer, "linear_attn.A_log");
+    errdefer log_decay.deinit(allocator);
+    var time_bias = try load_layer_vector(allocator, file, header, layer, "linear_attn.dt_bias");
+    errdefer time_bias.deinit(allocator);
+    let output_norm = try load_layer_vector(allocator, file, header, layer, "linear_attn.norm");
+    return DeltaNetWeights {
+        query_key_value: move query_key_value,
+        output_gate: move output_gate,
+        output: move output,
+        decay_gate_rows: move decay_gate_rows,
+        update_gate_rows: move update_gate_rows,
+        convolution: move convolution,
+        log_decay: move log_decay,
+        time_bias: move time_bias,
+        output_norm: move output_norm,
+    };
+}
+
+fn load_feed_forward(allocator: Allocator, file: []u8, file_address: u64, header: &yskn::ContainerHeader, layer: i64) -> ProjectionError!FeedForwardWeights {
+    var input_norm = try load_layer_vector(allocator, file, header, layer, "input_layernorm");
+    errdefer input_norm.deinit(allocator);
+    var post_mixer_norm = try load_layer_vector(allocator, file, header, layer, "post_attention_layernorm");
+    errdefer post_mixer_norm.deinit(allocator);
+    var gate = try load_layer_linear(allocator, file, file_address, header, layer, "mlp.gate_proj");
+    errdefer gate.deinit(allocator);
+    var up = try load_layer_linear(allocator, file, file_address, header, layer, "mlp.up_proj");
+    errdefer up.deinit(allocator);
+    let down = try load_layer_linear(allocator, file, file_address, header, layer, "mlp.down_proj");
+    return FeedForwardWeights {
+        input_norm: move input_norm,
+        post_mixer_norm: move post_mixer_norm,
+        gate: move gate,
+        up: move up,
+        down: move down,
+    };
+}
+
+pub fn load_model_weights(allocator: Allocator, file: []u8, file_address: u64, header: &yskn::ContainerHeader, layer_count: i64) -> ProjectionError!ModelWeights {
+    var layer_is_attention = array::new<bool>(allocator);
+    errdefer layer_is_attention.deinit(allocator);
+    var layer_mixer_index = array::new<i64>(allocator);
+    errdefer layer_mixer_index.deinit(allocator);
+    var attention_layers = array::new<AttentionWeights>(allocator);
+    errdefer attention_layers.deinit(allocator);
+    var delta_net_layers = array::new<DeltaNetWeights>(allocator);
+    errdefer delta_net_layers.deinit(allocator);
+    var feed_forward_layers = array::new<FeedForwardWeights>(allocator);
+    errdefer feed_forward_layers.deinit(allocator);
+    for 0..layer_count |layer| {
+        if try layer_has_tensor(allocator, header, layer, "self_attn.q_proj") {
+            try layer_is_attention.append(allocator, true);
+            try layer_mixer_index.append(allocator, attention_layers.len());
+            try attention_layers.append(allocator, try load_attention(allocator, file, file_address, header, layer));
+        } else {
+            try layer_is_attention.append(allocator, false);
+            try layer_mixer_index.append(allocator, delta_net_layers.len());
+            try delta_net_layers.append(allocator, try load_delta_net(allocator, file, file_address, header, layer));
+        }
+        try feed_forward_layers.append(allocator, try load_feed_forward(allocator, file, file_address, header, layer));
+    }
+    var final_norm = try load_vector_named(allocator, file, header, "norm");
+    errdefer final_norm.deinit(allocator);
+    var output_head = try load_linear_named(allocator, file, file_address, header, "lm_head");
+    errdefer output_head.deinit(allocator);
+    let embedding_tensor_index = yskn::find_tensor(header, "embed_tokens") orelse return ModelError::MissingTensor;
+    var embedding_input_signs = array::new<i8>(allocator);
+    errdefer embedding_input_signs.deinit(allocator);
+    var hidden_width: i64 = 0;
+    var vocabulary_size: i64 = 0;
+    if header.tensors.at(embedding_tensor_index) |record| {
+        hidden_width = record.cols;
+        vocabulary_size = record.rows;
+        for 0..record.cols |position| {
+            try embedding_input_signs.append(allocator, yskn::stream_sign(record.input_rotation.sign_rule, record.input_rotation.sign_seed, record.input_rotation.sign_offset + cast<u64>(position)));
+        }
+    }
+    return ModelWeights {
+        layer_count: layer_count,
+        hidden_width: hidden_width,
+        vocabulary_size: vocabulary_size,
+        layer_is_attention: move layer_is_attention,
+        layer_mixer_index: move layer_mixer_index,
+        attention_layers: move attention_layers,
+        delta_net_layers: move delta_net_layers,
+        feed_forward_layers: move feed_forward_layers,
+        final_norm: move final_norm,
+        output_head: move output_head,
+        embedding_tensor_index: embedding_tensor_index,
+        embedding_input_signs: move embedding_input_signs,
+    };
+}

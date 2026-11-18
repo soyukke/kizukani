@@ -1,0 +1,816 @@
+import std::array;
+import std::mem;
+
+@link_library("kernel32")
+extern "c" fn LoadLibraryA(name: ptr<const u8>) -> ?ptr<u8>
+@link_library("kernel32")
+extern "c" fn GetProcAddress(module: ptr<u8>, name: ptr<const u8>) -> ?ptr<u8>
+extern "c" fn memcpy(target: ptr<u8>, source: ptr<const u8>, byte_count: usize) -> ptr<u8>
+
+pub error VulkanError {
+    NoLibrary,
+    NoFunction,
+    NoInstance,
+    NoDevice,
+    NoQueue,
+    NoMemory,
+    NoBuffer,
+    BadModule,
+    PipelineFailed,
+    EncodeFailed,
+    KernelFailed,
+}
+
+struct Api {
+    create_instance: u64,
+    enumerate_physical_devices: u64,
+    get_physical_device_properties: u64,
+    get_physical_device_queue_family_properties: u64,
+    get_physical_device_memory_properties: u64,
+    get_physical_device_features2: u64,
+    create_device: u64,
+    get_device_queue: u64,
+    create_command_pool: u64,
+    allocate_command_buffers: u64,
+    create_fence: u64,
+    create_buffer: u64,
+    get_buffer_memory_requirements: u64,
+    allocate_memory: u64,
+    bind_buffer_memory: u64,
+    map_memory: u64,
+    get_buffer_device_address: u64,
+    destroy_buffer: u64,
+    free_memory: u64,
+    create_shader_module: u64,
+    destroy_shader_module: u64,
+    create_pipeline_layout: u64,
+    destroy_pipeline_layout: u64,
+    create_compute_pipelines: u64,
+    destroy_pipeline: u64,
+    reset_command_buffer: u64,
+    begin_command_buffer: u64,
+    end_command_buffer: u64,
+    cmd_bind_pipeline: u64,
+    cmd_push_constants: u64,
+    cmd_dispatch: u64,
+    cmd_pipeline_barrier: u64,
+    queue_submit: u64,
+    wait_for_fences: u64,
+    reset_fences: u64,
+    device_wait_idle: u64,
+    cmd_copy_buffer: u64,
+    create_query_pool: u64,
+    cmd_reset_query_pool: u64,
+    cmd_write_timestamp: u64,
+    get_query_pool_results: u64,
+}
+
+pub struct Gpu {
+    api: Api,
+    bindings: array::Array<u64>,
+    instance: u64,
+    physical: u64,
+    device: u64,
+    queue: u64,
+    pool: u64,
+    command: u64,
+    fence: u64,
+    host_memory_type: u64,
+    device_memory_type: u64,
+    readback_memory_type: u64,
+    query_pool: u64,
+}
+
+pub struct Library {
+    module: u64,
+}
+
+pub struct Kernel {
+    pipeline: u64,
+    layout: u64,
+    width: u64,
+    params: i64,
+}
+
+pub struct Buffer {
+    buffer: u64,
+    memory: u64,
+    mapped: u64,
+    address: u64,
+    byte_count: u64,
+}
+
+pub struct ComputePass {
+    api: Api,
+    query_pool: u64,
+    bindings: u64,
+    device: u64,
+    queue: u64,
+    command: u64,
+    fence: u64,
+}
+
+fn push_constant_bytes() -> u64 {
+    return 256;
+}
+
+fn load(module: ptr<u8>, name: ptr<const u8>) -> VulkanError!u64 {
+    // SAFETY: module is the loaded Vulkan loader and name is NUL-terminated.
+    let found = unsafe GetProcAddress(module, name) orelse return VulkanError::NoFunction;
+    // SAFETY: turning the address into an integer reads nothing.
+    return cast<u64>(unsafe int_from_ptr<usize>(found));
+}
+
+fn load_api(module: ptr<u8>) -> VulkanError!Api {
+    return Api {
+        create_instance: try load(module, c"vkCreateInstance"),
+        enumerate_physical_devices: try load(module, c"vkEnumeratePhysicalDevices"),
+        get_physical_device_properties: try load(module, c"vkGetPhysicalDeviceProperties"),
+        get_physical_device_queue_family_properties: try load(module, c"vkGetPhysicalDeviceQueueFamilyProperties"),
+        get_physical_device_memory_properties: try load(module, c"vkGetPhysicalDeviceMemoryProperties"),
+        get_physical_device_features2: try load(module, c"vkGetPhysicalDeviceFeatures2"),
+        create_device: try load(module, c"vkCreateDevice"),
+        get_device_queue: try load(module, c"vkGetDeviceQueue"),
+        create_command_pool: try load(module, c"vkCreateCommandPool"),
+        allocate_command_buffers: try load(module, c"vkAllocateCommandBuffers"),
+        create_fence: try load(module, c"vkCreateFence"),
+        create_buffer: try load(module, c"vkCreateBuffer"),
+        get_buffer_memory_requirements: try load(module, c"vkGetBufferMemoryRequirements"),
+        allocate_memory: try load(module, c"vkAllocateMemory"),
+        bind_buffer_memory: try load(module, c"vkBindBufferMemory"),
+        map_memory: try load(module, c"vkMapMemory"),
+        get_buffer_device_address: try load(module, c"vkGetBufferDeviceAddress"),
+        destroy_buffer: try load(module, c"vkDestroyBuffer"),
+        free_memory: try load(module, c"vkFreeMemory"),
+        create_shader_module: try load(module, c"vkCreateShaderModule"),
+        destroy_shader_module: try load(module, c"vkDestroyShaderModule"),
+        create_pipeline_layout: try load(module, c"vkCreatePipelineLayout"),
+        destroy_pipeline_layout: try load(module, c"vkDestroyPipelineLayout"),
+        create_compute_pipelines: try load(module, c"vkCreateComputePipelines"),
+        destroy_pipeline: try load(module, c"vkDestroyPipeline"),
+        reset_command_buffer: try load(module, c"vkResetCommandBuffer"),
+        begin_command_buffer: try load(module, c"vkBeginCommandBuffer"),
+        end_command_buffer: try load(module, c"vkEndCommandBuffer"),
+        cmd_bind_pipeline: try load(module, c"vkCmdBindPipeline"),
+        cmd_push_constants: try load(module, c"vkCmdPushConstants"),
+        cmd_dispatch: try load(module, c"vkCmdDispatch"),
+        cmd_pipeline_barrier: try load(module, c"vkCmdPipelineBarrier"),
+        queue_submit: try load(module, c"vkQueueSubmit"),
+        wait_for_fences: try load(module, c"vkWaitForFences"),
+        reset_fences: try load(module, c"vkResetFences"),
+        device_wait_idle: try load(module, c"vkDeviceWaitIdle"),
+        cmd_copy_buffer: try load(module, c"vkCmdCopyBuffer"),
+        create_query_pool: try load(module, c"vkCreateQueryPool"),
+        cmd_reset_query_pool: try load(module, c"vkCmdResetQueryPool"),
+        cmd_write_timestamp: try load(module, c"vkCmdWriteTimestamp"),
+        get_query_pool_results: try load(module, c"vkGetQueryPoolResults"),
+    };
+}
+
+/// address is a Vulkan command whose arguments are all integers or handles, at most nine of them.
+unsafe fn call(address: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64) -> u64 {
+    // SAFETY: the caller passes the address of a command; it ignores the arguments past its own.
+    let entry = unsafe ptr_from_int<ptr<const u8>>(cast<usize>(address));
+    // SAFETY: as above; extra integer arguments in registers or stack slots are not read by the callee.
+    let command = unsafe cast<extern "c" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(entry);
+    // SAFETY: as above.
+    return unsafe command(a, b, c, d, e, f, g, h, i);
+}
+
+fn succeeded(result: u64) -> bool {
+    return result & 0xffffffff == 0;
+}
+
+fn address_of(words: &var []u64) -> u64 {
+    // SAFETY: turning the address into an integer reads nothing.
+    return cast<u64>(unsafe int_from_ptr<usize>(mut_ptr_of(words)));
+}
+
+fn put32(words: &var []u64, offset: i64, value: u64) -> void {
+    let index = offset / 8;
+    if offset % 8 == 0 {
+        words[index] = (words[index] & ~cast<u64>(0xffffffff)) | (value & 0xffffffff);
+        return;
+    }
+    words[index] = (words[index] & 0xffffffff) | ((value & 0xffffffff) << 32);
+    return;
+}
+
+fn put64(words: &var []u64, offset: i64, value: u64) -> void {
+    words[offset / 8] = value;
+    return;
+}
+
+fn get32(words: &var []u64, offset: i64) -> u64 {
+    let index = offset / 8;
+    if offset % 8 == 0 {
+        return words[index] & 0xffffffff;
+    }
+    return words[index] >> 32;
+}
+
+fn get64(words: &var []u64, offset: i64) -> u64 {
+    return words[offset / 8];
+}
+
+fn print_device_name(words: &var []u64, offset: i64) -> void {
+    var length: i64 = 0;
+    while length < 255 {
+        let index = offset + length;
+        let byte = (words[index / 8] >> cast<u64>((index % 8) * 8)) & 0xff;
+        if byte == 0 {
+            break;
+        }
+        length = length + 1;
+    }
+    let first = address_of(words) + cast<u64>(offset);
+    // SAFETY: the length bytes from first lie inside words, which outlives the view.
+    let cells = unsafe ptr_from_int<ptr<const u8>>(cast<usize>(first));
+    // SAFETY: as above.
+    let name = unsafe view_from_ptr(cells, length);
+    print(name);
+    return;
+}
+
+pub fn open_default_gpu() -> !Gpu {
+    // SAFETY: the name is NUL-terminated; loading the Vulkan loader only runs its initializers.
+    let library = unsafe LoadLibraryA(c"vulkan-1.dll") orelse return VulkanError::NoLibrary;
+    let api = try load_api(library);
+    var storage = [1024]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    put32(words, 44, 4202496);
+    put32(words, 64, 1);
+    put64(words, 88, base);
+    // SAFETY: vkCreateInstance reads the create info and writes the handle at base + 160.
+    let created = unsafe call(api.create_instance, base + 64, 0, base + 160, 0, 0, 0, 0, 0, 0);
+    if !succeeded(created) {
+        return VulkanError::NoInstance;
+    }
+    let instance = get64(words, 160);
+    put32(words, 168, 16);
+    // SAFETY: vkEnumeratePhysicalDevices writes at most the count at base + 168 handles at base + 176.
+    let enumerated = unsafe call(api.enumerate_physical_devices, instance, base + 168, base + 176, 0, 0, 0, 0, 0, 0);
+    if enumerated & 0xffffffff != 0 and enumerated & 0xffffffff != 5 {
+        return VulkanError::NoDevice;
+    }
+    let count = cast<i64>(get32(words, 168));
+    if count == 0 {
+        return VulkanError::NoDevice;
+    }
+    var physical = get64(words, 176);
+    for 0..count |index| {
+        let candidate = get64(words, 176 + index * 8);
+        // SAFETY: vkGetPhysicalDeviceProperties writes 824 bytes at base + 512.
+        unsafe call(api.get_physical_device_properties, candidate, base + 512, 0, 0, 0, 0, 0, 0, 0);
+        if get32(words, 528) == 2 {
+            physical = candidate;
+            break;
+        }
+    }
+    // SAFETY: as above.
+    unsafe call(api.get_physical_device_properties, physical, base + 512, 0, 0, 0, 0, 0, 0, 0);
+    print_device_name(words, 532);
+    put32(words, 1536, 1000059000);
+    put64(words, 1544, base + 1792);
+    put32(words, 1792, 49);
+    put64(words, 1800, base + 1856);
+    put32(words, 1856, 51);
+    // SAFETY: vkGetPhysicalDeviceFeatures2 fills the chain at base + 1536, whose structs end before base + 2304.
+    unsafe call(api.get_physical_device_features2, physical, base + 1536, 0, 0, 0, 0, 0, 0, 0);
+    put32(words, 1552, 0);
+    put32(words, 168, 16);
+    // SAFETY: vkGetPhysicalDeviceQueueFamilyProperties writes at most 16 families of 24 bytes at base + 2304.
+    unsafe call(api.get_physical_device_queue_family_properties, physical, base + 168, base + 2304, 0, 0, 0, 0, 0, 0);
+    let families = cast<i64>(get32(words, 168));
+    var family: i64 = -1;
+    for 0..families |index| {
+        if get32(words, 2304 + index * 24) & 2 != 0 {
+            family = index;
+            break;
+        }
+    }
+    if family < 0 {
+        return VulkanError::NoQueue;
+    }
+    put32(words, 2816, 2);
+    put32(words, 2836, cast<u64>(family));
+    put32(words, 2840, 1);
+    put64(words, 2848, base + 2864);
+    put32(words, 2864, 0x3f800000);
+    put32(words, 2880, 3);
+    put64(words, 2888, base + 1536);
+    put32(words, 2900, 1);
+    put64(words, 2904, base + 2816);
+    // SAFETY: vkCreateDevice reads the create info chain and writes the handle at base + 2960.
+    let device_created = unsafe call(api.create_device, physical, base + 2880, 0, base + 2960, 0, 0, 0, 0, 0);
+    if !succeeded(device_created) {
+        return VulkanError::NoDevice;
+    }
+    let device = get64(words, 2960);
+    // SAFETY: vkGetDeviceQueue writes the queue handle at base + 2968.
+    unsafe call(api.get_device_queue, device, cast<u64>(family), 0, base + 2968, 0, 0, 0, 0, 0);
+    let queue = get64(words, 2968);
+    // SAFETY: vkGetPhysicalDeviceMemoryProperties writes 520 bytes at base + 3072.
+    unsafe call(api.get_physical_device_memory_properties, physical, base + 3072, 0, 0, 0, 0, 0, 0, 0);
+    let type_count = cast<i64>(get32(words, 3072));
+    var host_memory_type: i64 = -1;
+    for 0..type_count |index| {
+        if get32(words, 3076 + index * 8) & 7 == 7 {
+            host_memory_type = index;
+            break;
+        }
+    }
+    if host_memory_type < 0 {
+        for 0..type_count |index| {
+            if get32(words, 3076 + index * 8) & 6 == 6 {
+                host_memory_type = index;
+                break;
+            }
+        }
+    }
+    if host_memory_type < 0 {
+        return VulkanError::NoMemory;
+    }
+    var device_memory_type: i64 = -1;
+    for 0..type_count |index| {
+        if get32(words, 3076 + index * 8) == 1 {
+            device_memory_type = index;
+            break;
+        }
+    }
+    if device_memory_type < 0 {
+        device_memory_type = host_memory_type;
+    }
+    var readback_memory_type = host_memory_type;
+    for 0..type_count |index| {
+        if get32(words, 3076 + index * 8) & 14 == 14 {
+            readback_memory_type = index;
+            break;
+        }
+    }
+    put32(words, 3600, 39);
+    put32(words, 3616, 2);
+    put32(words, 3620, cast<u64>(family));
+    // SAFETY: vkCreateCommandPool reads the info and writes the handle at base + 3632.
+    let pool_created = unsafe call(api.create_command_pool, device, base + 3600, 0, base + 3632, 0, 0, 0, 0, 0);
+    if !succeeded(pool_created) {
+        return VulkanError::NoQueue;
+    }
+    let pool = get64(words, 3632);
+    put32(words, 3640, 40);
+    put64(words, 3656, pool);
+    put32(words, 3668, 1);
+    // SAFETY: vkAllocateCommandBuffers reads the info and writes one handle at base + 3680.
+    let allocated = unsafe call(api.allocate_command_buffers, device, base + 3640, base + 3680, 0, 0, 0, 0, 0, 0);
+    if !succeeded(allocated) {
+        return VulkanError::NoQueue;
+    }
+    let command = get64(words, 3680);
+    put32(words, 3688, 8);
+    // SAFETY: vkCreateFence reads the info and writes the handle at base + 3712.
+    let fence_created = unsafe call(api.create_fence, device, base + 3688, 0, base + 3712, 0, 0, 0, 0, 0);
+    if !succeeded(fence_created) {
+        return VulkanError::NoQueue;
+    }
+    let fence = get64(words, 3712);
+    put32(words, 3720, 11);
+    put32(words, 3740, 2);
+    put32(words, 3744, cast<u64>(query_capacity()));
+    // SAFETY: vkCreateQueryPool reads the info and writes the handle at base + 3760.
+    let pool_made = unsafe call(api.create_query_pool, device, base + 3720, 0, base + 3760, 0, 0, 0, 0, 0);
+    if !succeeded(pool_made) {
+        return VulkanError::NoQueue;
+    }
+    let query_pool = get64(words, 3760);
+    var bindings = array::new<u64>(mem::page_allocator());
+    errdefer bindings.deinit(mem::page_allocator());
+    for 0..binding_slots() * binding_words() + profile_words() |_| {
+        try bindings.append(mem::page_allocator(), 0);
+    }
+    return Gpu {
+        api: api,
+        bindings: move bindings,
+        instance: instance,
+        physical: physical,
+        device: device,
+        queue: queue,
+        pool: pool,
+        command: command,
+        fence: fence,
+        host_memory_type: cast<u64>(host_memory_type),
+        device_memory_type: cast<u64>(device_memory_type),
+        readback_memory_type: cast<u64>(readback_memory_type),
+        query_pool: query_pool
+    };
+}
+
+pub fn (self: &Gpu) new_shared_buffer(byte_count: u64) -> VulkanError!Buffer {
+    return self.new_buffer(byte_count, self.host_memory_type, true);
+}
+
+pub fn (self: &Gpu) new_readback_buffer(byte_count: u64) -> VulkanError!Buffer {
+    return self.new_buffer(byte_count, self.readback_memory_type, true);
+}
+
+pub fn (self: &Gpu) new_device_buffer(byte_count: u64) -> VulkanError!Buffer {
+    return self.new_buffer(byte_count, self.device_memory_type, false);
+}
+
+fn (self: &Gpu) new_buffer(byte_count: u64, memory_type: u64, mapped_for_host: bool) -> VulkanError!Buffer {
+    var storage = [64]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    put32(words, 0, 12);
+    put64(words, 24, byte_count);
+    put32(words, 32, 0x20023);
+    // SAFETY: vkCreateBuffer reads the info and writes the handle at base + 128.
+    let created = unsafe call(self.api.create_buffer, self.device, base, 0, base + 128, 0, 0, 0, 0, 0);
+    if !succeeded(created) {
+        return VulkanError::NoBuffer;
+    }
+    let buffer = get64(words, 128);
+    // SAFETY: vkGetBufferMemoryRequirements writes 24 bytes at base + 136.
+    unsafe call(self.api.get_buffer_memory_requirements, self.device, buffer, base + 136, 0, 0, 0, 0, 0, 0);
+    let size = get64(words, 136);
+    put32(words, 192, 1000060000);
+    put32(words, 208, 2);
+    put32(words, 224, 5);
+    put64(words, 232, base + 192);
+    put64(words, 240, size);
+    put32(words, 248, memory_type);
+    // SAFETY: vkAllocateMemory reads the info chain and writes the handle at base + 256.
+    let allocated = unsafe call(self.api.allocate_memory, self.device, base + 224, 0, base + 256, 0, 0, 0, 0, 0);
+    if !succeeded(allocated) {
+        return VulkanError::NoMemory;
+    }
+    let memory = get64(words, 256);
+    // SAFETY: the buffer and memory are fresh and the memory satisfies the buffer's requirements.
+    let bound = unsafe call(self.api.bind_buffer_memory, self.device, buffer, memory, 0, 0, 0, 0, 0, 0);
+    if !succeeded(bound) {
+        return VulkanError::NoMemory;
+    }
+    if mapped_for_host {
+        // SAFETY: vkMapMemory maps the whole host-visible allocation and writes the address at base + 264.
+        let mapped = unsafe call(self.api.map_memory, self.device, memory, 0, ~cast<u64>(0), 0, base + 264, 0, 0, 0);
+        if !succeeded(mapped) {
+            return VulkanError::NoMemory;
+        }
+    }
+    put32(words, 272, 1000244001);
+    put64(words, 288, buffer);
+    // SAFETY: vkGetBufferDeviceAddress reads the info at base + 272.
+    let address = unsafe call(self.api.get_buffer_device_address, self.device, base + 272, 0, 0, 0, 0, 0, 0, 0);
+    return Buffer { buffer: buffer, memory: memory, mapped: get64(words, 264), address: address, byte_count: byte_count };
+}
+
+pub fn (self: &Buffer) contents() -> ptr<u8> {
+    // SAFETY: mapped is the host address of byte_count bytes that stay mapped until release.
+    return unsafe ptr_from_int<ptr<u8>>(cast<usize>(self.mapped));
+}
+
+pub fn (self: &Buffer) device_address() -> u64 {
+    return self.address;
+}
+
+pub fn (self: Buffer) release(gpu: &Gpu) -> void {
+    // SAFETY: no submitted work uses the buffer once its pass finished.
+    unsafe call(gpu.api.destroy_buffer, gpu.device, self.buffer, 0, 0, 0, 0, 0, 0, 0);
+    // SAFETY: as above; freeing also unmaps.
+    unsafe call(gpu.api.free_memory, gpu.device, self.memory, 0, 0, 0, 0, 0, 0, 0);
+    return;
+}
+
+pub fn (self: &Gpu) load_library(code: []u8) -> VulkanError!Library {
+    var storage = [16]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    put32(words, 0, 16);
+    put64(words, 24, cast<u64>(mem::len(code)));
+    // SAFETY: turning the address into an integer reads nothing.
+    put64(words, 32, cast<u64>(unsafe int_from_ptr<usize>(ptr_of(code))));
+    // SAFETY: vkCreateShaderModule copies the code and writes the handle at base + 64.
+    let created = unsafe call(self.api.create_shader_module, self.device, base, 0, base + 64, 0, 0, 0, 0, 0);
+    if !succeeded(created) {
+        return VulkanError::BadModule;
+    }
+    return Library { module: get64(words, 64) };
+}
+
+pub fn (self: Gpu) deinit() -> void {
+    self.bindings.deinit(mem::page_allocator());
+    return;
+}
+
+pub fn (self: Library) release(gpu: &Gpu) -> void {
+    // SAFETY: pipelines made from the module do not need it after creation.
+    unsafe call(gpu.api.destroy_shader_module, gpu.device, self.module, 0, 0, 0, 0, 0, 0, 0);
+    return;
+}
+
+pub fn (self: &Library) kernel(gpu: &Gpu, function_name: ptr<const u8>, width: u64, params: i64) -> VulkanError!Kernel {
+    var storage = [64]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    put32(words, 0, 0x20);
+    put32(words, 4, 0);
+    put32(words, 8, push_constant_bytes());
+    put32(words, 16, 30);
+    put32(words, 48, 1);
+    put64(words, 56, base);
+    // SAFETY: vkCreatePipelineLayout reads the info and its push range and writes the handle at base + 64.
+    let layout_created = unsafe call(gpu.api.create_pipeline_layout, gpu.device, base + 16, 0, base + 64, 0, 0, 0, 0, 0);
+    if !succeeded(layout_created) {
+        return VulkanError::PipelineFailed;
+    }
+    let layout = get64(words, 64);
+    put32(words, 72, 0);
+    put32(words, 76, 0);
+    put64(words, 80, 4);
+    put32(words, 88, width);
+    put32(words, 96, 1);
+    put64(words, 104, base + 72);
+    put64(words, 112, 4);
+    put64(words, 120, base + 88);
+    put32(words, 128, 29);
+    put32(words, 152, 18);
+    put32(words, 172, 0x20);
+    put64(words, 176, self.module);
+    // SAFETY: turning the address into an integer reads nothing.
+    put64(words, 184, cast<u64>(unsafe int_from_ptr<usize>(function_name)));
+    put64(words, 192, base + 96);
+    put64(words, 200, layout);
+    put32(words, 216, 0xffffffff);
+    // SAFETY: vkCreateComputePipelines reads the info chain and writes one handle at base + 240.
+    let created = unsafe call(gpu.api.create_compute_pipelines, gpu.device, 0, 1, base + 128, 0, base + 240, 0, 0, 0);
+    if !succeeded(created) {
+        return VulkanError::PipelineFailed;
+    }
+    return Kernel { pipeline: get64(words, 240), layout: layout, width: width, params: params };
+}
+
+pub fn (self: Kernel) release(gpu: &Gpu) -> void {
+    // SAFETY: no submitted work uses the pipeline once its pass finished.
+    unsafe call(gpu.api.destroy_pipeline, gpu.device, self.pipeline, 0, 0, 0, 0, 0, 0, 0);
+    // SAFETY: as above.
+    unsafe call(gpu.api.destroy_pipeline_layout, gpu.device, self.layout, 0, 0, 0, 0, 0, 0, 0);
+    return;
+}
+
+pub fn (self: &Gpu) begin_compute_pass() -> VulkanError!ComputePass {
+    var storage = [4]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    put32(words, 0, 42);
+    put32(words, 16, 1);
+    // SAFETY: the command buffer is not pending; the last pass waited for its fence.
+    unsafe call(self.api.reset_command_buffer, self.command, 0, 0, 0, 0, 0, 0, 0, 0);
+    // SAFETY: vkBeginCommandBuffer reads the info at base.
+    let begun = unsafe call(self.api.begin_command_buffer, self.command, base, 0, 0, 0, 0, 0, 0, 0);
+    if !succeeded(begun) {
+        return VulkanError::EncodeFailed;
+    }
+    let binding_view = self.bindings.as_slice();
+    // SAFETY: turning the address into an integer reads nothing.
+    let bindings = cast<u64>(unsafe int_from_ptr<usize>(ptr_of(binding_view)));
+    // SAFETY: the command buffer is recording and the pool holds query_capacity() queries.
+    unsafe call(self.api.cmd_reset_query_pool, self.command, self.query_pool, 0, cast<u64>(query_capacity()), 0, 0, 0, 0, 0);
+    // SAFETY: the binding table holds profile_words() words past the bindings, and no pass is in flight.
+    let table = unsafe ptr_from_int<ptr<u64>>(cast<usize>(bindings));
+    // SAFETY: as above.
+    let cells = unsafe mut_view_from_ptr(table, binding_slots() * binding_words() + profile_words());
+    cells[profile_first()] = 0;
+    return ComputePass { api: self.api, query_pool: self.query_pool, bindings: bindings, device: self.device, queue: self.queue, command: self.command, fence: self.fence };
+}
+
+fn query_capacity() -> i64 {
+    return 4096;
+}
+
+fn profile_kernels() -> i64 {
+    return 32;
+}
+
+fn profile_first() -> i64 {
+    return binding_slots() * binding_words();
+}
+
+fn profile_words() -> i64 {
+    return 1 + query_capacity() / 2 + profile_kernels() * 3;
+}
+
+fn binding_slots() -> i64 {
+    return 32;
+}
+
+fn binding_words() -> i64 {
+    return 18;
+}
+
+fn (self: &ComputePass) binding_table() -> ptr<u64> {
+    // SAFETY: bindings is the address of the Gpu's binding table, which outlives every pass it begins.
+    return unsafe ptr_from_int<ptr<u64>>(cast<usize>(self.bindings));
+}
+
+pub fn (self: &ComputePass) bind_buffer_from(index: u64, buffer: &Buffer, byte_offset: u64) -> void {
+    // SAFETY: the table holds binding_slots() * binding_words() words, and no other view of it is live.
+    let cells = unsafe mut_view_from_ptr(self.binding_table(), binding_slots() * binding_words());
+    let first = cast<i64>(index) * binding_words();
+    cells[first] = buffer.address + byte_offset;
+    cells[first + 1] = 0;
+    return;
+}
+
+pub fn (self: &ComputePass) bind_buffer(index: u64, buffer: &Buffer) -> void {
+    self.bind_buffer_from(index, buffer, 0);
+    return;
+}
+
+pub fn (self: &ComputePass) bind_bytes(index: u64, bytes: []u8) -> void {
+    // SAFETY: the table holds binding_slots() * binding_words() words, and no other view of it is live.
+    let cells = unsafe mut_view_from_ptr(self.binding_table(), binding_slots() * binding_words());
+    let first = cast<i64>(index) * binding_words();
+    let length = mem::len(bytes);
+    cells[first + 1] = cast<u64>(length);
+    for 0..(binding_words() - 2) |word| {
+        var value: u64 = 0;
+        for 0..8 |byte| {
+            let position = word * 8 + byte;
+            if position < length {
+                value = value | (cast<u64>(bytes[position]) << cast<u64>(byte * 8));
+            }
+        }
+        cells[first + 2 + word] = value;
+    }
+    cells[first] = cells[first + 2];
+    return;
+}
+
+pub fn (self: &ComputePass) dispatch_threadgroups(kernel: &Kernel, threadgroup_count: u64, threadgroup_width: u64) -> void {
+    if threadgroup_width != kernel.width {
+        print("vulkan: a dispatch width differs from its pipeline");
+    }
+    // SAFETY: the table holds binding_slots() * binding_words() words, and no other view of it is live.
+    let cells = unsafe mut_view_from_ptr(self.binding_table(), binding_slots() * binding_words());
+    var arguments = [32]u64{};
+    let argument_view = arguments.as_mut_slice();
+    for 0..kernel.params |index| {
+        argument_view[index] = cells[index * binding_words()];
+    }
+    let length_first = kernel.params * binding_words();
+    let length_count = cast<i64>(cells[length_first + 1]) / 8;
+    for 0..length_count |index| {
+        argument_view[kernel.params + index] = cells[length_first + 2 + index];
+    }
+    argument_view[kernel.params + length_count] = cells[(kernel.params + 1) * binding_words()];
+    let used = argument_view[0..(kernel.params + length_count + 1)];
+    self.dispatch_groups(kernel, threadgroup_count, used);
+    return;
+}
+
+pub fn (self: &ComputePass) dispatch_groups(kernel: &Kernel, group_count: u64, arguments: []u64) -> void {
+    var storage = [4]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    // SAFETY: the pipeline is a compute pipeline alive until the pass finishes.
+    unsafe call(self.api.cmd_bind_pipeline, self.command, 1, kernel.pipeline, 0, 0, 0, 0, 0, 0);
+    // SAFETY: turning the address into an integer reads nothing.
+    let values = cast<u64>(unsafe int_from_ptr<usize>(ptr_of(arguments)));
+    let byte_count = cast<u64>(mem::count<u64>(arguments) * 8);
+    // SAFETY: vkCmdPushConstants copies byte_count bytes, which fit the layout's push range.
+    unsafe call(self.api.cmd_push_constants, self.command, kernel.layout, 0x20, 0, byte_count, values, 0, 0, 0);
+    // SAFETY: the table holds the bindings and the profile words, and no other view of it is live.
+    let cells = unsafe mut_view_from_ptr(self.binding_table(), binding_slots() * binding_words() + profile_words());
+    let query = cast<i64>(cells[profile_first()]);
+    let timed = query + 2 <= query_capacity();
+    if timed {
+        cells[profile_first() + 1 + query / 2] = kernel.pipeline;
+        cells[profile_first()] = cast<u64>(query + 2);
+        // SAFETY: the query index is below the pool's capacity and was reset when the pass began.
+        unsafe call(self.api.cmd_write_timestamp, self.command, 0x800, self.query_pool, cast<u64>(query), 0, 0, 0, 0, 0);
+    }
+    // SAFETY: the bound pipeline and push constants are recorded above.
+    unsafe call(self.api.cmd_dispatch, self.command, group_count, 1, 1, 0, 0, 0, 0, 0);
+    if timed {
+        // SAFETY: as above.
+        unsafe call(self.api.cmd_write_timestamp, self.command, 0x800, self.query_pool, cast<u64>(query + 1), 0, 0, 0, 0, 0);
+    }
+    put32(words, 0, 46);
+    put32(words, 16, 0x40);
+    put32(words, 20, 0x60);
+    // SAFETY: vkCmdPipelineBarrier reads one memory barrier at base.
+    unsafe call(self.api.cmd_pipeline_barrier, self.command, 0x800, 0x800, 0, 1, base, 0, 0, 0);
+    return;
+}
+
+pub fn (self: &ComputePass) copy_buffer(source: &Buffer, source_offset: u64, target: &Buffer, target_offset: u64, byte_count: u64) -> void {
+    var storage = [4]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    put64(words, 0, source_offset);
+    put64(words, 8, target_offset);
+    put64(words, 16, byte_count);
+    // SAFETY: vkCmdCopyBuffer reads one region at base; both buffers outlive the pass.
+    unsafe call(self.api.cmd_copy_buffer, self.command, source.buffer, target.buffer, 1, base, 0, 0, 0, 0);
+    return;
+}
+
+pub fn (self: &Gpu) upload(target: &Buffer, source: ptr<const u8>, byte_count: u64) -> !void {
+    let chunk: u64 = 268435456;
+    let staging = try self.new_shared_buffer(chunk);
+    defer staging.release(self);
+    var done: u64 = 0;
+    while done < byte_count {
+        var count = byte_count - done;
+        if count > chunk {
+            count = chunk;
+        }
+        // SAFETY: reading an address as an integer touches no memory.
+        let first = cast<u64>(unsafe int_from_ptr<usize>(source)) + done;
+        // SAFETY: the staging buffer holds chunk bytes, source holds byte_count bytes, and the two do not overlap.
+        unsafe memcpy(staging.contents(), unsafe ptr_from_int<ptr<const u8>>(cast<usize>(first)), cast<usize>(count));
+        let pass = try self.begin_compute_pass();
+        pass.copy_buffer(&staging, 0, target, done, count);
+        try pass.finish();
+        done = done + count;
+    }
+    return;
+}
+
+pub fn (self: &ComputePass) dispatch_threads(kernel: &Kernel, thread_count: u64, arguments: []u64) -> void {
+    let groups = (thread_count + kernel.width - 1) / kernel.width;
+    self.dispatch_groups(kernel, groups, arguments);
+    return;
+}
+
+pub fn (self: ComputePass) finish() -> VulkanError!void {
+    var storage = [16]u64{};
+    let words = storage.as_mut_slice();
+    let base = address_of(words);
+    // SAFETY: the command buffer is recording.
+    let ended = unsafe call(self.api.end_command_buffer, self.command, 0, 0, 0, 0, 0, 0, 0, 0);
+    if !succeeded(ended) {
+        return VulkanError::EncodeFailed;
+    }
+    put64(words, 96, self.command);
+    put32(words, 0, 4);
+    put32(words, 40, 1);
+    put64(words, 48, base + 96);
+    // SAFETY: vkQueueSubmit reads the submit info at base and its command handle at base + 96.
+    let submitted = unsafe call(self.api.queue_submit, self.queue, 1, base, self.fence, 0, 0, 0, 0, 0);
+    if !succeeded(submitted) {
+        return VulkanError::KernelFailed;
+    }
+    put64(words, 104, self.fence);
+    // SAFETY: vkWaitForFences reads one fence handle at base + 104.
+    let waited = unsafe call(self.api.wait_for_fences, self.device, 1, base + 104, 1, ~cast<u64>(0), 0, 0, 0, 0);
+    // SAFETY: as above; the fence signalled or the device was lost.
+    unsafe call(self.api.reset_fences, self.device, 1, base + 104, 0, 0, 0, 0, 0, 0);
+    if !succeeded(waited) {
+        return VulkanError::KernelFailed;
+    }
+    self.collect_profile();
+    return;
+}
+
+fn (self: &ComputePass) collect_profile() -> void {
+    // SAFETY: the table holds the bindings and the profile words, and the pass finished.
+    let cells = unsafe mut_view_from_ptr(self.binding_table(), binding_slots() * binding_words() + profile_words());
+    let queries = cast<i64>(cells[profile_first()]);
+    if queries == 0 {
+        return;
+    }
+    var stamps = [4096]u64{};
+    let stamp_view = stamps.as_mut_slice();
+    // SAFETY: vkGetQueryPoolResults writes queries 64-bit results into stamps, which holds query_capacity() of them.
+    unsafe call(self.api.get_query_pool_results, self.device, self.query_pool, 0, cast<u64>(queries), cast<u64>(queries * 8), address_of(stamp_view), 8, 3, 0);
+    let table = profile_first() + 1 + query_capacity() / 2;
+    for 0..(queries / 2) |pair| {
+        let pipeline = cells[profile_first() + 1 + pair];
+        let elapsed = stamp_view[pair * 2 + 1] - stamp_view[pair * 2];
+        for 0..profile_kernels() |slot| {
+            let entry = table + slot * 3;
+            if cells[entry] == pipeline or cells[entry] == 0 {
+                cells[entry] = pipeline;
+                cells[entry + 1] = cells[entry + 1] + elapsed;
+                cells[entry + 2] = cells[entry + 2] + 1;
+                break;
+            }
+        }
+    }
+    return;
+}
+
+pub fn (self: &Gpu) print_profile(kernel: &Kernel, name: []u8) -> void {
+    let table = self.bindings.as_slice();
+    let first = profile_first() + 1 + query_capacity() / 2;
+    for 0..profile_kernels() |slot| {
+        let entry = first + slot * 3;
+        if table[entry] == kernel.pipeline {
+            print(name);
+            print(table[entry + 1] / 1000);
+            print(table[entry + 2]);
+        }
+    }
+    return;
+}

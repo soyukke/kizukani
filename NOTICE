@@ -1,0 +1,24 @@
+kizukani
+Copyright 2026 soyukke
+
+kizukani is an unofficial engine for YASAKANI model files, written in Kizu. It is not affiliated with or
+endorsed by the YASAKANI authors, the Mackani author, the Qwen team or any other organisation.
+
+This product is informed by, and includes material derived from, the following works under the Apache
+License, Version 2.0:
+
+YASAKANI
+Copyright 2026 the YASAKANI authors
+https://github.com/yasakani-dev/yasakani
+
+Mackani
+Copyright 2026 TKY-27 (https://github.com/TKY-27)
+https://github.com/TKY-27/Mackani
+
+Qwen3.8-27B chat template
+Copyright 2026 Alibaba Cloud
+https://huggingface.co/Qwen/Qwen3.8-27B
+
+Model files are not included. They are distributed separately by the YASAKANI authors.
+
+Third-party material is listed in THIRD_PARTY_NOTICES.md.

@@ -1,0 +1,628 @@
+import std::array;
+import std::fs;
+import std::io;
+import std::mem;
+import std::string;
+
+fn table_slots() -> i64 {
+    return 1048576;
+}
+
+fn longest_token_bytes() -> i64 {
+    return 8192;
+}
+
+/// Byte-pair encoding tables read from tokenizer.json, with its added tokens.
+pub struct Tokenizer {
+    tables: UnicodeTables,
+    pool: string::String,
+    starts: array::Array<i64>,
+    lengths: array::Array<i64>,
+    string_slots: array::Array<i32>,
+    pair_keys: array::Array<u64>,
+    pair_ranks: array::Array<u32>,
+    pair_tokens: array::Array<u32>,
+    byte_tokens: array::Array<i64>,
+    added_pool: string::String,
+    added_starts: array::Array<i64>,
+    added_tokens: array::Array<i64>,
+}
+
+fn is_plain_byte(value: i64) -> bool {
+    return (value >= 33 and value <= 126) or (value >= 161 and value <= 172) or (value >= 174 and value <= 255);
+}
+
+fn hash_bytes(bytes: []u8) -> u64 {
+    var hash: u64 = 2166136261;
+    for 0..mem::len(bytes) |index| {
+        hash = ((hash ^ cast<u64>(bytes[index])) * 16777619) & 0xffffffff;
+    }
+    return hash;
+}
+
+fn find_bytes(text: []u8, needle: []u8, from: i64) -> i64 {
+    let count = mem::len(needle);
+    var at = from;
+    while at + count <= mem::len(text) {
+        if text[at] == needle[0] and mem::equal_bytes(text[at..at + count], needle) {
+            return at;
+        }
+        at = at + 1;
+    }
+    return -1;
+}
+
+fn hex_digit(value: u8) -> TextError!u32 {
+    if value >= 48 and value <= 57 {
+        return cast<u32>(value) - 48;
+    }
+    if value >= 97 and value <= 102 {
+        return cast<u32>(value) - 87;
+    }
+    if value >= 65 and value <= 70 {
+        return cast<u32>(value) - 55;
+    }
+    return TextError::BadTokenizer;
+}
+
+fn read_hex_unit(bytes: []u8, at: i64) -> TextError!u32 {
+    var unit: u32 = 0;
+    for 0..4 |offset| {
+        let digit = try hex_digit(bytes[at + offset]);
+        unit = unit * 16 + digit;
+    }
+    return unit;
+}
+
+/// Reads the JSON string character at cursor into its code point, moving cursor past it.
+fn read_json_point(bytes: []u8, cursor: &var i64) -> TextError!u32 {
+    let at = cursor.*;
+    if bytes[at] != 92 {
+        let decoded = decode_point(bytes, at);
+        cursor.* = at + cast<i64>(decoded >> 32);
+        return cast<u32>(decoded & 0xffffffff);
+    }
+    let escape = bytes[at + 1];
+    cursor.* = at + 2;
+    if escape == 110 {
+        return 10;
+    }
+    if escape == 116 {
+        return 9;
+    }
+    if escape == 114 {
+        return 13;
+    }
+    if escape == 98 {
+        return 8;
+    }
+    if escape == 102 {
+        return 12;
+    }
+    if escape != 117 {
+        return cast<u32>(escape);
+    }
+    let unit = try read_hex_unit(bytes, at + 2);
+    cursor.* = at + 6;
+    if unit >= 0xd800 and unit < 0xdc00 and bytes[at + 6] == 92 and bytes[at + 7] == 117 {
+        let low = try read_hex_unit(bytes, at + 8);
+        cursor.* = at + 12;
+        return 0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00);
+    }
+    return unit;
+}
+
+/// Reads a byte-level JSON string at cursor into out and returns its length; split receives where a space stood, or -1.
+fn read_level_string(bytes: []u8, cursor: &var i64, unmapped: []i64, out: &var []u8, split: &var i64) -> TextError!i64 {
+    cursor.* = cursor.* + 1;
+    var count: i64 = 0;
+    split.* = -1;
+    while bytes[cursor.*] != 34 {
+        let point = try read_json_point(bytes, cursor);
+        if point == 32 {
+            split.* = count;
+        } else {
+            if cast<i64>(point) >= mem::count<i64>(unmapped) or unmapped[cast<i64>(point)] < 0 {
+                return TextError::BadTokenizer;
+            }
+            out[count] = cast<u8>(unmapped[cast<i64>(point)]);
+            count = count + 1;
+        }
+    }
+    cursor.* = cursor.* + 1;
+    return count;
+}
+
+fn read_number(bytes: []u8, cursor: &var i64) -> i64 {
+    var value: i64 = 0;
+    while bytes[cursor.*] >= 48 and bytes[cursor.*] <= 57 {
+        value = value * 10 + cast<i64>(bytes[cursor.*]) - 48;
+        cursor.* = cursor.* + 1;
+    }
+    return value;
+}
+
+fn skip_separators(bytes: []u8, cursor: &var i64) -> void {
+    while bytes[cursor.*] == 32 or bytes[cursor.*] == 10 or bytes[cursor.*] == 13 or bytes[cursor.*] == 9 or bytes[cursor.*] == 44 or bytes[cursor.*] == 58 {
+        cursor.* = cursor.* + 1;
+    }
+    return;
+}
+
+fn position_after(bytes: []u8, needle: []u8, from: i64) -> TextError!i64 {
+    let position = find_bytes(bytes, needle, from);
+    if position < 0 {
+        return TextError::BadTokenizer;
+    }
+    return position + mem::len(needle);
+}
+
+fn expect_position(position: i64) -> TextError!i64 {
+    if position < 0 {
+        return TextError::BadTokenizer;
+    }
+    return position;
+}
+
+fn (self: &Tokenizer) token_of(bytes: []u8) -> i64 {
+    let slots = self.string_slots.as_slice();
+    let pool = self.pool.as_bytes();
+    let starts = self.starts.as_slice();
+    let lengths = self.lengths.as_slice();
+    var slot = cast<i64>(hash_bytes(bytes)) & (table_slots() - 1);
+    while slots[slot] != 0 {
+        let token = cast<i64>(slots[slot]) - 1;
+        if lengths[token] == mem::len(bytes) and mem::equal_bytes(pool[starts[token]..starts[token] + lengths[token]], bytes) {
+            return token;
+        }
+        slot = (slot + 1) & (table_slots() - 1);
+    }
+    return -1;
+}
+
+fn pair_slot(first: i64, second: i64) -> i64 {
+    let mixed = (cast<u64>(first) * 2654435761 + cast<u64>(second) * 40503) & 0xffffffffffff;
+    return cast<i64>((mixed ^ (mixed >> 19)) & cast<u64>(table_slots() - 1));
+}
+
+fn (self: &Tokenizer) pair_at(first: i64, second: i64) -> i64 {
+    let keys = self.pair_keys.as_slice();
+    let key = ((cast<u64>(first) + 1) << 32) | cast<u64>(second);
+    var slot = pair_slot(first, second);
+    while keys[slot] != 0 {
+        if keys[slot] == key {
+            return slot;
+        }
+        slot = (slot + 1) & (table_slots() - 1);
+    }
+    return -1;
+}
+
+fn (self: &var Tokenizer) insert_pair(first: i64, second: i64, rank: u32, merged: u32) -> void {
+    let keys = self.pair_keys.as_mut_slice();
+    let ranks = self.pair_ranks.as_mut_slice();
+    let tokens = self.pair_tokens.as_mut_slice();
+    var slot = pair_slot(first, second);
+    while keys[slot] != 0 {
+        slot = (slot + 1) & (table_slots() - 1);
+    }
+    keys[slot] = ((cast<u64>(first) + 1) << 32) | cast<u64>(second);
+    ranks[slot] = rank;
+    tokens[slot] = merged;
+    return;
+}
+
+/// Reads the tables at tables_path and the tokenizer description at tokenizer_path.
+pub fn load_tokenizer(allocator: Allocator, tables_path: []u8, tokenizer_path: []u8) -> !Tokenizer {
+    let tables = try load_unicode_tables(allocator, tables_path);
+    var tokenizer = Tokenizer {
+        tables: move tables,
+        pool: string::new(allocator),
+        starts: array::new<i64>(allocator),
+        lengths: array::new<i64>(allocator),
+        string_slots: array::new<i32>(allocator),
+        pair_keys: array::new<u64>(allocator),
+        pair_ranks: array::new<u32>(allocator),
+        pair_tokens: array::new<u32>(allocator),
+        byte_tokens: array::new<i64>(allocator),
+        added_pool: string::new(allocator),
+        added_starts: array::new<i64>(allocator),
+        added_tokens: array::new<i64>(allocator),
+    };
+    errdefer tokenizer.deinit(allocator);
+    let file = try fs::read_file(io::blocking(), allocator, &tokenizer_path, mem::Limit::Unlimited);
+    defer file.deinit(allocator);
+    let bytes = file.as_bytes();
+    try tokenizer.string_slots.reserve(allocator, table_slots());
+    try tokenizer.pair_keys.reserve(allocator, table_slots());
+    try tokenizer.pair_ranks.reserve(allocator, table_slots());
+    try tokenizer.pair_tokens.reserve(allocator, table_slots());
+    for 0..table_slots() |slot| {
+        try tokenizer.string_slots.append(allocator, 0);
+        try tokenizer.pair_keys.append(allocator, 0);
+        try tokenizer.pair_ranks.append(allocator, 0);
+        try tokenizer.pair_tokens.append(allocator, 0);
+    }
+    var mapped = [256]i64{};
+    let mapped_view = mapped.as_mut_slice();
+    var unmapped = [324]i64{};
+    let unmapped_view = unmapped.as_mut_slice();
+    for 0..324 |point| {
+        unmapped_view[point] = -1;
+    }
+    var extra: i64 = 0;
+    for 0..256 |value| {
+        if is_plain_byte(value) {
+            mapped_view[value] = value;
+        } else {
+            mapped_view[value] = 256 + extra;
+            extra = extra + 1;
+        }
+        unmapped_view[mapped_view[value]] = value;
+    }
+    var cursor = try expect_position(find_bytes(bytes, "added_tokens", 0));
+    cursor = try position_after(bytes, "[", cursor);
+    try tokenizer.added_starts.append(allocator, 0);
+    while true {
+        skip_separators(bytes, &var cursor);
+        if bytes[cursor] == 93 {
+            break;
+        }
+        let id_at = try expect_position(find_bytes(bytes, "id", cursor));
+        var id_cursor = id_at + 3;
+        skip_separators(bytes, &var id_cursor);
+        let token = read_number(bytes, &var id_cursor);
+        let content_at = try expect_position(find_bytes(bytes, "content", cursor));
+        var content_cursor = content_at + 8;
+        skip_separators(bytes, &var content_cursor);
+        content_cursor = content_cursor + 1;
+        while bytes[content_cursor] != 34 {
+            let point = try read_json_point(bytes, &var content_cursor);
+            try append_point(allocator, point, &var tokenizer.added_pool);
+        }
+        try tokenizer.added_starts.append(allocator, tokenizer.added_pool.len());
+        try tokenizer.added_tokens.append(allocator, token);
+        cursor = try position_after(bytes, "}", content_cursor);
+    }
+    cursor = try expect_position(find_bytes(bytes, "vocab", cursor));
+    cursor = try position_after(bytes, "{", cursor);
+    var scratch = [8192]u8{};
+    var scratch_view = scratch.as_mut_bytes();
+    var split: i64 = -1;
+    var entry_tokens = array::new<i64>(allocator);
+    defer entry_tokens.deinit(allocator);
+    var entry_starts = array::new<i64>(allocator);
+    defer entry_starts.deinit(allocator);
+    var entry_lengths = array::new<i64>(allocator);
+    defer entry_lengths.deinit(allocator);
+    var largest: i64 = -1;
+    while true {
+        skip_separators(bytes, &var cursor);
+        if bytes[cursor] == 125 {
+            break;
+        }
+        let length = try read_level_string(bytes, &var cursor, unmapped_view, &var scratch_view, &var split);
+        skip_separators(bytes, &var cursor);
+        let token = read_number(bytes, &var cursor);
+        try entry_tokens.append(allocator, token);
+        try entry_starts.append(allocator, tokenizer.pool.len());
+        try entry_lengths.append(allocator, length);
+        for 0..length |index| {
+            try tokenizer.pool.append_byte(allocator, scratch_view[index]);
+        }
+        if token > largest {
+            largest = token;
+        }
+    }
+    for 0..(largest + 1) |token| {
+        try tokenizer.starts.append(allocator, 0);
+        try tokenizer.lengths.append(allocator, 0);
+    }
+    if true {
+        let token_view = entry_tokens.as_slice();
+        let start_view = entry_starts.as_slice();
+        let length_view = entry_lengths.as_slice();
+        let starts = tokenizer.starts.as_mut_slice();
+        let lengths = tokenizer.lengths.as_mut_slice();
+        let slots = tokenizer.string_slots.as_mut_slice();
+        let pool = tokenizer.pool.as_bytes();
+        for 0..entry_tokens.len() |entry| {
+            let token = token_view[entry];
+            starts[token] = start_view[entry];
+            lengths[token] = length_view[entry];
+            var slot = cast<i64>(hash_bytes(pool[start_view[entry]..start_view[entry] + length_view[entry]])) & (table_slots() - 1);
+            while slots[slot] != 0 {
+                slot = (slot + 1) & (table_slots() - 1);
+            }
+            slots[slot] = cast<i32>(token + 1);
+        }
+    }
+    for 0..256 |value| {
+        let single = [1]u8{ cast<u8>(value) };
+        let single_view = single.as_bytes();
+        let token = tokenizer.token_of(single_view);
+        if token < 0 {
+            return TextError::BadTokenizer;
+        }
+        try tokenizer.byte_tokens.append(allocator, token);
+    }
+    cursor = try expect_position(find_bytes(bytes, "merges", cursor));
+    cursor = try position_after(bytes, "[", cursor);
+    var rank: u32 = 0;
+    while true {
+        skip_separators(bytes, &var cursor);
+        if bytes[cursor] == 93 {
+            break;
+        }
+        let length = try read_level_string(bytes, &var cursor, unmapped_view, &var scratch_view, &var split);
+        if split <= 0 or split >= length {
+            return TextError::BadTokenizer;
+        }
+        let whole = scratch_view[0..length];
+        let first = tokenizer.token_of(whole[0..split]);
+        let second = tokenizer.token_of(whole[split..length]);
+        let merged = tokenizer.token_of(whole);
+        if first < 0 or second < 0 or merged < 0 {
+            return TextError::BadTokenizer;
+        }
+        tokenizer.insert_pair(first, second, rank, cast<u32>(merged));
+        rank = rank + 1;
+    }
+    return move tokenizer;
+}
+
+pub fn (self: Tokenizer) deinit(allocator: Allocator) -> void {
+    self.added_tokens.deinit(allocator);
+    self.added_starts.deinit(allocator);
+    self.added_pool.deinit(allocator);
+    self.byte_tokens.deinit(allocator);
+    self.pair_tokens.deinit(allocator);
+    self.pair_ranks.deinit(allocator);
+    self.pair_keys.deinit(allocator);
+    self.string_slots.deinit(allocator);
+    self.lengths.deinit(allocator);
+    self.starts.deinit(allocator);
+    self.pool.deinit(allocator);
+    self.tables.deinit(allocator);
+    return;
+}
+
+fn is_line_break(point: u32) -> bool {
+    return point == 10 or point == 13;
+}
+
+fn is_contraction_letter(point: u32, lower: u32) -> bool {
+    return point == lower or point == lower - 32 or (lower == 115 and point == 0x17f);
+}
+
+fn contraction_end(points: []u32, at: i64) -> i64 {
+    let count = mem::count<u32>(points);
+    if points[at] != 39 or at + 1 >= count {
+        return -1;
+    }
+    let first = points[at + 1];
+    if is_contraction_letter(first, 115) or is_contraction_letter(first, 116) {
+        return at + 2;
+    }
+    if at + 2 < count {
+        if is_contraction_letter(first, 114) and is_contraction_letter(points[at + 2], 101) {
+            return at + 3;
+        }
+        if is_contraction_letter(first, 118) and is_contraction_letter(points[at + 2], 101) {
+            return at + 3;
+        }
+    }
+    if is_contraction_letter(first, 109) {
+        return at + 2;
+    }
+    if at + 2 < count and is_contraction_letter(first, 108) and is_contraction_letter(points[at + 2], 108) {
+        return at + 3;
+    }
+    if is_contraction_letter(first, 100) {
+        return at + 2;
+    }
+    return -1;
+}
+
+fn letter_run_end(classes: []u8, from: i64) -> i64 {
+    var at = from;
+    while at < mem::count<u8>(classes) and (classes[at] & (class_letter() | class_mark())) != 0 {
+        at = at + 1;
+    }
+    return at;
+}
+
+/// Returns where the piece starting at at ends, as the pre-tokenizer pattern's alternatives choose it.
+fn piece_end(points: []u32, classes: []u8, at: i64) -> i64 {
+    let count = mem::count<u32>(points);
+    let contraction = contraction_end(points, at);
+    if contraction >= 0 {
+        return contraction;
+    }
+    let class = classes[at];
+    if !is_line_break(points[at]) and (class & (class_letter() | class_number())) == 0 {
+        let run = letter_run_end(classes, at + 1);
+        if run > at + 1 {
+            return run;
+        }
+    }
+    if (class & (class_letter() | class_mark())) != 0 {
+        return letter_run_end(classes, at);
+    }
+    if (class & class_number()) != 0 {
+        return at + 1;
+    }
+    var symbol = at;
+    if points[symbol] == 32 {
+        symbol = symbol + 1;
+    }
+    var symbol_end = symbol;
+    while symbol_end < count and (classes[symbol_end] & (class_space() | class_letter() | class_mark() | class_number())) == 0 {
+        symbol_end = symbol_end + 1;
+    }
+    if symbol_end > symbol {
+        while symbol_end < count and is_line_break(points[symbol_end]) {
+            symbol_end = symbol_end + 1;
+        }
+        return symbol_end;
+    }
+    if (class & class_space()) != 0 {
+        var run_end = at;
+        var last_break: i64 = -1;
+        while run_end < count and (classes[run_end] & class_space()) != 0 {
+            if is_line_break(points[run_end]) {
+                last_break = run_end;
+            }
+            run_end = run_end + 1;
+        }
+        if last_break >= 0 {
+            return last_break + 1;
+        }
+        if run_end == count or run_end - at == 1 {
+            return run_end;
+        }
+        return run_end - 1;
+    }
+    return at + 1;
+}
+
+fn (self: &Tokenizer) encode_piece(allocator: Allocator, piece: []u8, symbols: &var array::Array<i64>, out: &var array::Array<i64>) -> mem::Error!void {
+    let length = mem::len(piece);
+    while symbols.len() < length {
+        try symbols.append(allocator, 0);
+    }
+    let symbol_view = symbols.as_mut_slice();
+    let byte_view = self.byte_tokens.as_slice();
+    let ranks = self.pair_ranks.as_slice();
+    let tokens = self.pair_tokens.as_slice();
+    for 0..length |index| {
+        symbol_view[index] = byte_view[cast<i64>(piece[index])];
+    }
+    var count = length;
+    while count > 1 {
+        var best: i64 = -1;
+        var best_rank: u32 = 0;
+        var best_token: i64 = 0;
+        for 0..(count - 1) |index| {
+            let slot = self.pair_at(symbol_view[index], symbol_view[index + 1]);
+            if slot >= 0 and (best < 0 or ranks[slot] < best_rank) {
+                best = index;
+                best_rank = ranks[slot];
+                best_token = cast<i64>(tokens[slot]);
+            }
+        }
+        if best < 0 {
+            break;
+        }
+        symbol_view[best] = best_token;
+        for (best + 1)..(count - 1) |index| {
+            symbol_view[index] = symbol_view[index + 1];
+        }
+        count = count - 1;
+    }
+    for 0..count |index| {
+        try out.append(allocator, symbol_view[index]);
+    }
+    return;
+}
+
+fn (self: &Tokenizer) encode_segment(allocator: Allocator, text: []u8, out: &var array::Array<i64>) -> mem::Error!void {
+    if mem::len(text) == 0 {
+        return;
+    }
+    var normalized = string::new(allocator);
+    defer normalized.deinit(allocator);
+    try self.tables.normalize_nfc(allocator, text, &var normalized);
+    let bytes = normalized.as_bytes();
+    var points = array::new<u32>(allocator);
+    defer points.deinit(allocator);
+    var classes = string::new(allocator);
+    defer classes.deinit(allocator);
+    var offsets = array::new<i64>(allocator);
+    defer offsets.deinit(allocator);
+    var index: i64 = 0;
+    while index < mem::len(bytes) {
+        let decoded = decode_point(bytes, index);
+        let point = cast<u32>(decoded & 0xffffffff);
+        try points.append(allocator, point);
+        try classes.append_byte(allocator, self.tables.class_of(point));
+        try offsets.append(allocator, index);
+        index = index + cast<i64>(decoded >> 32);
+    }
+    try offsets.append(allocator, index);
+    var symbols = array::new<i64>(allocator);
+    defer symbols.deinit(allocator);
+    let point_view = points.as_slice();
+    let class_view = classes.as_bytes();
+    let offset_view = offsets.as_slice();
+    var at: i64 = 0;
+    while at < points.len() {
+        let end = piece_end(point_view, class_view, at);
+        try self.encode_piece(allocator, bytes[offset_view[at]..offset_view[end]], &var symbols, out);
+        at = end;
+    }
+    return;
+}
+
+fn (self: &Tokenizer) added_at(text: []u8, at: i64) -> i64 {
+    let pool = self.added_pool.as_bytes();
+    let starts = self.added_starts.as_slice();
+    var best: i64 = -1;
+    var best_length: i64 = 0;
+    for 0..self.added_tokens.len() |added| {
+        let length = starts[added + 1] - starts[added];
+        if length > best_length and at + length <= mem::len(text) and mem::equal_bytes(text[at..at + length], pool[starts[added]..starts[added + 1]]) {
+            best = added;
+            best_length = length;
+        }
+    }
+    return best;
+}
+
+/// Appends the token ids of text to out; added tokens written in the text are recognized.
+pub fn (self: &Tokenizer) encode(allocator: Allocator, text: []u8, out: &var array::Array<i64>) -> mem::Error!void {
+    let count = mem::len(text);
+    let starts = self.added_starts.as_slice();
+    let tokens = self.added_tokens.as_slice();
+    var from: i64 = 0;
+    var at: i64 = 0;
+    while at < count {
+        var added: i64 = -1;
+        if text[at] == 60 {
+            added = self.added_at(text, at);
+        }
+        if added >= 0 {
+            try self.encode_segment(allocator, text[from..at], out);
+            try out.append(allocator, tokens[added]);
+            at = at + starts[added + 1] - starts[added];
+            from = at;
+        } else {
+            at = at + 1;
+        }
+    }
+    try self.encode_segment(allocator, text[from..count], out);
+    return;
+}
+
+/// Appends the bytes token stands for to out.
+pub fn (self: &Tokenizer) append_token_bytes(allocator: Allocator, token: i64, out: &var string::String) -> mem::Error!void {
+    if token < self.starts.len() {
+        let pool = self.pool.as_bytes();
+        let first = self.starts.get_or_panic(token);
+        for 0..self.lengths.get_or_panic(token) |offset| {
+            try out.append_byte(allocator, pool[first + offset]);
+        }
+        return;
+    }
+    let pool = self.added_pool.as_bytes();
+    let starts = self.added_starts.as_slice();
+    let tokens = self.added_tokens.as_slice();
+    for 0..self.added_tokens.len() |added| {
+        if tokens[added] == token {
+            for starts[added]..starts[added + 1] |offset| {
+                try out.append_byte(allocator, pool[offset]);
+            }
+        }
+    }
+    return;
+}

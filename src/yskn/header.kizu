@@ -1,0 +1,411 @@
+import std::array;
+import std::json;
+import std::mem;
+import std::string;
+
+pub error ContainerError {
+    NotYskn,
+    UnsupportedFeature,
+    InvalidHeader,
+    MissingMember,
+}
+
+pub error HeaderError = ContainerError or json::DecodeError or mem::Error;
+
+pub enum TensorRole {
+    Body,
+    Head,
+    Embedding,
+    Draft,
+}
+
+pub enum CodeLayout {
+    Row,
+    Warp,
+}
+
+pub struct SignedHadamard {
+    pub block_count: i64,
+    pub sign_seed: u64,
+    pub sign_offset: u64,
+    pub sign_rule: SignRule,
+}
+
+pub union OutputRotation {
+    Unrotated,
+    Rotated(SignedHadamard),
+}
+
+pub struct TensorRecord {
+    pub name: string::String,
+    pub role: TensorRole,
+    pub rows: i64,
+    pub cols: i64,
+    pub physical_rows: i64,
+    pub bits_per_step: i64,
+    pub layout: CodeLayout,
+    pub code_offset: i64,
+    pub code_byte_count: i64,
+    pub state_values_offset: i64,
+    pub row_scales_offset: i64,
+    pub input_rotation: SignedHadamard,
+    pub output_rotation: OutputRotation,
+}
+
+pub enum VectorEncoding {
+    F16,
+    Bf16,
+}
+
+pub struct VectorRecord {
+    pub name: string::String,
+    pub offset: i64,
+    pub count: i64,
+    pub encoding: VectorEncoding,
+}
+
+pub struct ContainerHeader {
+    pub version: i64,
+    pub header_byte_count: i64,
+    pub data_offset: i64,
+    pub file_byte_count: i64,
+    pub tensors: array::Array<TensorRecord>,
+    pub vectors: array::Array<VectorRecord>,
+}
+
+pub fn state_value_table_byte_count() -> i64 {
+    return 16384;
+}
+
+pub fn read_little_endian(bytes: []u8, offset: i64, width: i64) -> u64 {
+    var value: u64 = 0;
+    var index = width - 1;
+    while index >= 0 {
+        value = (value << 8) | cast<u64>(bytes[offset + index]);
+        index = index - 1;
+    }
+    return value;
+}
+
+fn member(object: &json::Value, key: []u8) -> ?&json::Value {
+    match object {
+        Obj(fields) => return fields.at(key),
+        _ => return null,
+    }
+}
+
+fn non_negative_integer(value: &json::Value) -> ContainerError!i64 {
+    match value {
+        I64(number) => {
+            if number < 0 {
+                return ContainerError::InvalidHeader;
+            }
+            return number;
+        },
+        _ => return ContainerError::InvalidHeader,
+    }
+}
+
+fn required_integer(object: &json::Value, key: []u8) -> ContainerError!i64 {
+    if member(object, key) |found| {
+        return try non_negative_integer(found);
+    }
+    return ContainerError::MissingMember;
+}
+
+fn integer_or_default(object: &json::Value, key: []u8, default_value: i64) -> ContainerError!i64 {
+    if member(object, key) |found| {
+        return try non_negative_integer(found);
+    }
+    return default_value;
+}
+
+fn text_equals(object: &json::Value, key: []u8, expected: []u8, default_text: []u8) -> ContainerError!bool {
+    if member(object, key) |found| {
+        match found {
+            Str(text) => {
+                let bytes = text.as_bytes();
+                return mem::equal_bytes(bytes, expected);
+            },
+            _ => return ContainerError::InvalidHeader,
+        }
+    }
+    return mem::equal_bytes(default_text, expected);
+}
+
+fn is_absent_or_null(object: &json::Value, key: []u8) -> bool {
+    if member(object, key) |found| {
+        match found {
+            Null => return true,
+            _ => return false,
+        }
+    }
+    return true;
+}
+
+fn copy_name(allocator: Allocator, object: &json::Value) -> HeaderError!string::String {
+    if member(object, "name") |found| {
+        match found {
+            Str(text) => {
+                let bytes = text.as_bytes();
+                if mem::len(bytes) == 0 {
+                    return ContainerError::InvalidHeader;
+                }
+                return try string::from_bytes(allocator, bytes);
+            },
+            _ => return ContainerError::InvalidHeader,
+        }
+    }
+    return ContainerError::MissingMember;
+}
+
+fn require_region_inside(offset: i64, length: i64, first: i64, end: i64) -> ContainerError!void {
+    if offset < first or length < 0 or offset > end - length {
+        return ContainerError::InvalidHeader;
+    }
+    return;
+}
+
+fn parse_sign_rule(object: &json::Value) -> ContainerError!SignRule {
+    if try text_equals(object, "rule", "mulberry32_7919_13", "splitmix64") {
+        return SignRule::Mulberry32;
+    }
+    if try text_equals(object, "rule", "splitmix64", "splitmix64") {
+        return SignRule::SplitMix64;
+    }
+    return ContainerError::UnsupportedFeature;
+}
+
+fn parse_signed_hadamard(object: &json::Value, block_count: i64) -> ContainerError!SignedHadamard {
+    if !try text_equals(object, "kind", "H512", "") {
+        return ContainerError::UnsupportedFeature;
+    }
+    if try integer_or_default(object, "qm_off", 0) != 0 {
+        return ContainerError::InvalidHeader;
+    }
+    if try required_integer(object, "m") != block_count {
+        return ContainerError::InvalidHeader;
+    }
+    let rule = try parse_sign_rule(object);
+    let seed = try required_integer(object, "sign_seed");
+    let offset = try required_integer(object, "sign_offset");
+    return SignedHadamard { block_count: block_count, sign_seed: cast<u64>(seed), sign_offset: cast<u64>(offset), sign_rule: rule };
+}
+
+fn parse_role(object: &json::Value) -> ContainerError!TensorRole {
+    if try text_equals(object, "role", "body", "") {
+        return TensorRole::Body;
+    }
+    if try text_equals(object, "role", "head", "") {
+        return TensorRole::Head;
+    }
+    if try text_equals(object, "role", "embedding", "") {
+        return TensorRole::Embedding;
+    }
+    if try text_equals(object, "role", "draft", "") {
+        return TensorRole::Draft;
+    }
+    return ContainerError::UnsupportedFeature;
+}
+
+fn parse_layout(object: &json::Value) -> ContainerError!CodeLayout {
+    if try text_equals(object, "layout", "warp", "warp") {
+        return CodeLayout::Warp;
+    }
+    if try text_equals(object, "layout", "row", "warp") {
+        return CodeLayout::Row;
+    }
+    return ContainerError::UnsupportedFeature;
+}
+
+fn default_input_rotation(cols: i64) -> SignedHadamard {
+    return SignedHadamard { block_count: cols / 512, sign_seed: 7, sign_offset: 0, sign_rule: SignRule::Mulberry32 };
+}
+
+fn parse_output_rotation(object: &json::Value, role: TensorRole, rows: i64, cols: i64) -> ContainerError!OutputRotation {
+    if member(object, "rot_out") |found| {
+        if is_absent_or_null(object, "rot_out") {
+            return OutputRotation::Unrotated;
+        }
+        if try text_equals(found, "kind", "none", "") {
+            return OutputRotation::Unrotated;
+        }
+        return OutputRotation::Rotated(try parse_signed_hadamard(found, rows / 512));
+    }
+    if role == TensorRole::Head or role == TensorRole::Embedding or role == TensorRole::Draft {
+        return OutputRotation::Unrotated;
+    }
+    return OutputRotation::Rotated(SignedHadamard { block_count: rows / 512, sign_seed: 7, sign_offset: cast<u64>(cols), sign_rule: SignRule::Mulberry32 });
+}
+
+fn require_only_supported_codec(object: &json::Value) -> ContainerError!void {
+    if try integer_or_default(object, "l", 12) != 12 {
+        return ContainerError::UnsupportedFeature;
+    }
+    if try integer_or_default(object, "d", 2) != 2 {
+        return ContainerError::UnsupportedFeature;
+    }
+    if try integer_or_default(object, "t", 256) != 256 {
+        return ContainerError::UnsupportedFeature;
+    }
+    if !try text_equals(object, "start", "zero", "zero") {
+        return ContainerError::UnsupportedFeature;
+    }
+    if !is_absent_or_null(object, "rar") {
+        return ContainerError::UnsupportedFeature;
+    }
+    if try integer_or_default(object, "bias_off", 0) != 0 {
+        return ContainerError::UnsupportedFeature;
+    }
+    return;
+}
+
+fn parse_tensor(allocator: Allocator, object: &json::Value, data_offset: i64, file_byte_count: i64) -> HeaderError!TensorRecord {
+    let role = try parse_role(object);
+    let rows = try required_integer(object, "rows");
+    let cols = try required_integer(object, "cols");
+    let physical_rows = try integer_or_default(object, "physical_rows", rows);
+    if rows == 0 or cols == 0 or cols % 512 != 0 or physical_rows < rows {
+        return ContainerError::InvalidHeader;
+    }
+    try require_only_supported_codec(object);
+    let bits_per_step = try required_integer(object, "bits");
+    if bits_per_step < 4 or bits_per_step > 8 {
+        return ContainerError::UnsupportedFeature;
+    }
+    let layout = try parse_layout(object);
+    let sequence_count = physical_rows * (cols / 256);
+    if layout == CodeLayout::Warp and sequence_count % 32 != 0 {
+        return ContainerError::InvalidHeader;
+    }
+    let code_offset = try required_integer(object, "stream_off");
+    let code_byte_count = try required_integer(object, "stream_bytes");
+    if code_byte_count != sequence_count * bits_per_step * 16 {
+        return ContainerError::InvalidHeader;
+    }
+    let state_values_offset = try required_integer(object, "lut_off");
+    let row_scales_offset = try required_integer(object, "scale_off");
+    try require_region_inside(code_offset, code_byte_count, data_offset, file_byte_count);
+    try require_region_inside(state_values_offset, state_value_table_byte_count(), data_offset, file_byte_count);
+    try require_region_inside(row_scales_offset, physical_rows * 2, data_offset, file_byte_count);
+
+    var input_rotation = default_input_rotation(cols);
+    if member(object, "rot_in") |found| {
+        input_rotation = try parse_signed_hadamard(found, cols / 512);
+    }
+    let output_rotation = try parse_output_rotation(object, role, rows, cols);
+    match output_rotation {
+        Rotated(rotation) => {
+            if rows % 512 != 0 or physical_rows % 512 != 0 {
+                return ContainerError::InvalidHeader;
+            }
+        },
+        Unrotated => {},
+    }
+    let name = try copy_name(allocator, object);
+    return TensorRecord {
+        name: move name,
+        role: role,
+        rows: rows,
+        cols: cols,
+        physical_rows: physical_rows,
+        bits_per_step: bits_per_step,
+        layout: layout,
+        code_offset: code_offset,
+        code_byte_count: code_byte_count,
+        state_values_offset: state_values_offset,
+        row_scales_offset: row_scales_offset,
+        input_rotation: input_rotation,
+        output_rotation: output_rotation,
+    };
+}
+
+fn parse_vector(allocator: Allocator, object: &json::Value, data_offset: i64, file_byte_count: i64) -> HeaderError!VectorRecord {
+    let offset = try required_integer(object, "off");
+    let count = try required_integer(object, "n");
+    try require_region_inside(offset, count * 2, data_offset, file_byte_count);
+    var encoding = VectorEncoding::F16;
+    if try text_equals(object, "dtype", "bf16", "f16") {
+        encoding = VectorEncoding::Bf16;
+    } else if !try text_equals(object, "dtype", "f16", "f16") {
+        return ContainerError::UnsupportedFeature;
+    }
+    let name = try copy_name(allocator, object);
+    return VectorRecord { name: move name, offset: offset, count: count, encoding: encoding };
+}
+
+pub fn read_container_header(allocator: Allocator, file: []u8) -> HeaderError!ContainerHeader {
+    let file_length = mem::len(file);
+    if file_length < 32 {
+        return ContainerError::NotYskn;
+    }
+    let magic = file[0..4];
+    if !mem::equal_bytes(magic, "YSKN") {
+        return ContainerError::NotYskn;
+    }
+    let version = cast<i64>(read_little_endian(file, 4, 4));
+    if version != 1 {
+        return ContainerError::UnsupportedFeature;
+    }
+    let header_byte_count = cast<i64>(read_little_endian(file, 8, 8));
+    let data_offset = cast<i64>(read_little_endian(file, 16, 8));
+    let file_byte_count = cast<i64>(read_little_endian(file, 24, 8));
+    if file_byte_count != file_length or header_byte_count < 0 or data_offset < 32 or header_byte_count > data_offset - 32 or data_offset > file_byte_count {
+        return ContainerError::InvalidHeader;
+    }
+    for 32 + header_byte_count..data_offset |padding| {
+        if file[padding] != 0 {
+            return ContainerError::InvalidHeader;
+        }
+    }
+    let header_text = file[32..32 + header_byte_count];
+    var root = try json::decode<json::Value>(allocator, header_text);
+    defer root.deinit(allocator);
+    if member(&root, "model") |_| {
+    } else {
+        return ContainerError::MissingMember;
+    }
+
+    var tensors = array::new<TensorRecord>(allocator);
+    errdefer tensors.deinit(allocator);
+    var vectors = array::new<VectorRecord>(allocator);
+    errdefer vectors.deinit(allocator);
+    if member(&root, "tensors") |tensor_list| {
+        match tensor_list {
+            Arr(items) => {
+                var index: i64 = 0;
+                while items.at(index) |item| {
+                    let record = try parse_tensor(allocator, item, data_offset, file_byte_count);
+                    try tensors.append(allocator, move record);
+                    index = index + 1;
+                }
+            },
+            _ => return ContainerError::InvalidHeader,
+        }
+    } else {
+        return ContainerError::MissingMember;
+    }
+    if member(&root, "vectors") |vector_list| {
+        match vector_list {
+            Arr(items) => {
+                var index: i64 = 0;
+                while items.at(index) |item| {
+                    let record = try parse_vector(allocator, item, data_offset, file_byte_count);
+                    try vectors.append(allocator, move record);
+                    index = index + 1;
+                }
+            },
+            _ => return ContainerError::InvalidHeader,
+        }
+    } else {
+        return ContainerError::MissingMember;
+    }
+    return ContainerHeader {
+        version: version,
+        header_byte_count: header_byte_count,
+        data_offset: data_offset,
+        file_byte_count: file_byte_count,
+        tensors: move tensors,
+        vectors: move vectors,
+    };
+}

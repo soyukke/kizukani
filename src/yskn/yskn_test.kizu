@@ -1,0 +1,28 @@
+import std::testing;
+
+test "f16 widens normal values exactly" {
+    testing::expect(f16_to_f32(0x3c00) == 1.0);
+    testing::expect(f16_to_f32(0xc000) == -2.0);
+    testing::expect(f16_to_f32(0x7bff) == 65504.0);
+}
+
+test "f16 widens the smallest subnormal exactly" {
+    testing::expect(f16_to_f32(0x0001) == 0.000000059604645);
+}
+
+test "f16 keeps the sign of a negative subnormal" {
+    testing::expect(f16_to_f32(0x8001) == -0.000000059604645);
+}
+
+test "bf16 widens to the binary32 with the same upper half" {
+    testing::expect(bf16_to_f32(0x3f80) == 1.0);
+    testing::expect(bf16_to_f32(0xc040) == -3.0);
+}
+
+test "binary32 bits round trip normal, subnormal and zero values" {
+    testing::expect_equal<u32>(0x3f800000, binary32_bits(1.0));
+    testing::expect_equal<u32>(0xc0400000, binary32_bits(-3.0));
+    testing::expect_equal<u32>(0x00000001, binary32_bits(binary32_from_bits(0x00000001)));
+    testing::expect_equal<u32>(0x807fffff, binary32_bits(binary32_from_bits(0x807fffff)));
+    testing::expect_equal<u32>(0, binary32_bits(0.0));
+}

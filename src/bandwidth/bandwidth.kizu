@@ -1,0 +1,47 @@
+import kizukani::metal;
+
+pub fn measure_read_gigabytes_per_second(gpu: &metal::Gpu, byte_count: u64, rounds: i64) -> metal::MetalError!f64 {
+    let source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\kernel void xor_fold_every_quad(device const uint4 *quads [[buffer(0)]],
+        \\                               device uint *folded_per_thread [[buffer(1)]],
+        \\                               constant uint &quad_count [[buffer(2)]],
+        \\                               uint thread_position [[thread_position_in_grid]],
+        \\                               uint threads [[threads_per_grid]]) {
+        \\    uint4 folded = 0;
+        \\    for (uint quad = thread_position; quad < quad_count; quad += threads) {
+        \\        folded ^= quads[quad];
+        \\    }
+        \\    folded_per_thread[thread_position] = folded.x ^ folded.y ^ folded.z ^ folded.w;
+        \\}
+    ;
+    let kernel = try gpu.compile_kernel(source, c"xor_fold_every_quad");
+    defer kernel.release();
+    let thread_count: u64 = 1048576;
+    let quads = try gpu.new_shared_buffer(byte_count);
+    defer quads.release();
+    let folded_per_thread = try gpu.new_shared_buffer(thread_count * 4);
+    defer folded_per_thread.release();
+    let quad_count = try gpu.new_shared_buffer(4);
+    defer quad_count.release();
+    // SAFETY: quad_count holds one u32.
+    let quad_count_cell = unsafe cast<ptr<u32>>(quad_count.contents());
+    // SAFETY: as above.
+    unsafe ptr_write(quad_count_cell, cast<u32>(byte_count / 16));
+
+    var best_gpu_seconds: f64 = 1.0e9;
+    for 0..rounds |round| {
+        let pass = try gpu.begin_compute_pass();
+        pass.bind_buffer(0, &quads);
+        pass.bind_buffer(1, &folded_per_thread);
+        pass.bind_buffer(2, &quad_count);
+        pass.dispatch_threads(&kernel, thread_count);
+        let gpu_seconds = try pass.finish_and_measure_gpu_seconds();
+        if gpu_seconds < best_gpu_seconds {
+            best_gpu_seconds = gpu_seconds;
+        }
+    }
+    return cast<f64>(byte_count) / best_gpu_seconds / 1.0e9;
+}

@@ -1,0 +1,70 @@
+import std::float;
+
+fn two_to_the_minus_149() -> f64 {
+    return float::from_bits(0x36a0000000000000);
+}
+
+fn two_to_the_minus_24() -> f64 {
+    return float::from_bits(0x3e70000000000000);
+}
+
+pub fn binary32_from_bits(bits: u32) -> f32 {
+    let wide = cast<u64>(bits);
+    let sign = (wide >> 31) << 63;
+    let exponent = (wide >> 23) & 0xff;
+    let fraction = wide & 0x7fffff;
+    if exponent == 0 {
+        let magnitude = cast<f64>(fraction) * two_to_the_minus_149();
+        return cast<f32>(float::from_bits(float::bits(magnitude) | sign));
+    }
+    if exponent == 255 {
+        return cast<f32>(float::from_bits(sign | 0x7ff0000000000000 | (fraction << 29)));
+    }
+    return cast<f32>(float::from_bits(sign | ((exponent + 896) << 52) | (fraction << 29)));
+}
+
+pub fn binary32_bits(value: f32) -> u32 {
+    let wide = float::bits(cast<f64>(value));
+    let sign = cast<u32>(wide >> 63) << 31;
+    let exponent = cast<i64>((wide >> 52) & 0x7ff);
+    let fraction = wide & 0xfffffffffffff;
+    if exponent == 0 {
+        return sign;
+    }
+    if exponent == 0x7ff {
+        var payload = cast<u32>(fraction >> 29);
+        if fraction != 0 and payload == 0 {
+            payload = 0x400000;
+        }
+        return sign | 0x7f800000 | payload;
+    }
+    let rebiased = exponent - 896;
+    if rebiased >= 1 {
+        return sign | (cast<u32>(rebiased) << 23) | cast<u32>(fraction >> 29);
+    }
+    let with_hidden_bit = fraction | 0x10000000000000;
+    return sign | cast<u32>(with_hidden_bit >> cast<u64>(30 - rebiased));
+}
+
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let wide = cast<u32>(bits);
+    let sign = (wide >> 15) << 31;
+    let exponent = (wide >> 10) & 0x1f;
+    let fraction = wide & 0x3ff;
+    if exponent == 0 {
+        let magnitude = cast<f64>(fraction) * two_to_the_minus_24();
+        let signed_magnitude = cast<f32>(magnitude);
+        if sign != 0 {
+            return -signed_magnitude;
+        }
+        return signed_magnitude;
+    }
+    if exponent == 31 {
+        return binary32_from_bits(sign | 0x7f800000 | (fraction << 13));
+    }
+    return binary32_from_bits(sign | ((exponent + 112) << 23) | (fraction << 13));
+}
+
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    return binary32_from_bits(cast<u32>(bits) << 16);
+}

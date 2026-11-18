@@ -1,0 +1,429 @@
+import std::mem;
+
+@link_library("objc")
+extern "c" fn objc_msgSend() -> void
+@link_library("objc")
+extern "c" fn objc_getClass(name: ptr<const u8>) -> ?ptr<u8>
+@link_library("objc")
+extern "c" fn sel_registerName(name: ptr<const u8>) -> ptr<u8>
+@link_library("objc")
+extern "c" fn objc_autoreleasePoolPush() -> ptr<u8>
+@link_library("objc")
+extern "c" fn objc_autoreleasePoolPop(pool: ptr<u8>) -> void
+@link_framework("Metal")
+extern "c" fn MTLCreateSystemDefaultDevice() -> ?ptr<u8>
+extern "c" fn strlen(text: ptr<const u8>) -> usize
+
+pub error MetalError {
+    NoDevice,
+    NoQueue,
+    CompileFailed,
+    NoFunction,
+    PipelineFailed,
+    NoBuffer,
+    EncodeFailed,
+    KernelFailed,
+}
+
+extern "c" struct MtlSize {
+    width: u64,
+    height: u64,
+    depth: u64,
+}
+
+fn ns_utf8_string_encoding() -> u64 {
+    return 4;
+}
+
+fn mtl_resource_storage_mode_shared() -> u64 {
+    return 0;
+}
+
+fn mtl_command_buffer_status_completed() -> u64 {
+    return 4;
+}
+
+/// device and queue are retained Metal objects that release() gives up.
+pub unsafe struct Gpu {
+    device: ptr<u8>,
+    queue: ptr<u8>,
+}
+
+/// pipeline is a retained MTLComputePipelineState.
+pub unsafe struct Kernel {
+    pipeline: ptr<u8>,
+    max_threads_per_threadgroup: u64,
+}
+
+/// object is a retained shared MTLBuffer and contents_address its byte_count bytes.
+pub unsafe struct Buffer {
+    object: ptr<u8>,
+    contents_address: ptr<u8>,
+    byte_count: u64,
+}
+
+/// object is a retained MTLLibrary.
+pub unsafe struct Library {
+    object: ptr<u8>,
+}
+
+/// commands and encoder are a retained command buffer and its compute encoder.
+pub unsafe struct ComputePass {
+    commands: ptr<u8>,
+    encoder: ptr<u8>,
+}
+
+fn selector_named(name: ptr<const u8>) -> ptr<u8> {
+    // SAFETY: name is a NUL-terminated selector name, and registering one only interns it.
+    return unsafe sel_registerName(name);
+}
+
+fn objc_msg_send_address() -> ptr<const u8> {
+    // SAFETY: taking the address reads nothing; each caller casts it to the C signature of the method it sends.
+    return unsafe cast<ptr<const u8>>(objc_msgSend);
+}
+
+/// The caller names a method of receiver that takes nothing and returns an object or nil.
+unsafe fn send_returning_object(receiver: ptr<u8>, selector: ptr<u8>) -> ?ptr<u8> {
+    // SAFETY: the caller names a method of this signature.
+    let method = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above.
+    return unsafe method(receiver, selector);
+}
+
+/// The caller names a method of receiver that takes and returns nothing.
+unsafe fn send_returning_nothing(receiver: ptr<u8>, selector: ptr<u8>) -> void {
+    // SAFETY: the caller names a method of this signature.
+    let method = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>) -> void>(objc_msg_send_address());
+    // SAFETY: as above.
+    unsafe method(receiver, selector);
+}
+
+/// The caller names a method of receiver that takes nothing and returns an NSUInteger.
+unsafe fn send_returning_u64(receiver: ptr<u8>, selector: ptr<u8>) -> u64 {
+    // SAFETY: the caller names a method of this signature.
+    let method = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>) -> u64>(objc_msg_send_address());
+    // SAFETY: as above.
+    return unsafe method(receiver, selector);
+}
+
+/// The caller names a method of receiver that takes nothing and returns a double.
+unsafe fn send_returning_f64(receiver: ptr<u8>, selector: ptr<u8>) -> f64 {
+    // SAFETY: the caller names a method of this signature.
+    let method = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>) -> f64>(objc_msg_send_address());
+    // SAFETY: as above.
+    return unsafe method(receiver, selector);
+}
+
+/// The caller names a method of receiver that takes one object and returns nothing.
+unsafe fn send_object_returning_nothing(receiver: ptr<u8>, selector: ptr<u8>, object: ptr<u8>) -> void {
+    // SAFETY: the caller names a method of this signature.
+    let method = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>) -> void>(objc_msg_send_address());
+    // SAFETY: as above.
+    unsafe method(receiver, selector, object);
+}
+
+/// The caller names a method of receiver that takes two MTLSize by value.
+unsafe fn send_two_mtl_sizes(receiver: ptr<u8>, selector: ptr<u8>, first: MtlSize, second: MtlSize) -> void {
+    // SAFETY: the caller names a method of this signature.
+    let method = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, MtlSize, MtlSize) -> void>(objc_msg_send_address());
+    // SAFETY: as above.
+    unsafe method(receiver, selector, first, second);
+}
+
+/// The caller owns one reference to object and gives it up.
+unsafe fn release_object(object: ptr<u8>) -> void {
+    // SAFETY: the caller owns the reference this gives up.
+    unsafe send_returning_nothing(object, selector_named(c"release"));
+}
+
+/// The caller passes a live object that this module keeps past its autorelease pool.
+unsafe fn retain_object(object: ptr<u8>) -> void {
+    // SAFETY: the caller passes a live object; retain returns it again.
+    unsafe send_returning_object(object, selector_named(c"retain"));
+    return;
+}
+
+/// The caller passes nil or a live NSError.
+unsafe fn print_ns_error(error: ?ptr<u8>) -> void {
+    if error |object| {
+        // SAFETY: object is an NSError, which answers localizedDescription.
+        let description = unsafe send_returning_object(object, selector_named(c"localizedDescription")) orelse return;
+        // SAFETY: an NSString answers UTF8String with a NUL-terminated copy alive until the enclosing autorelease pool pops.
+        let utf8 = unsafe send_returning_object(description, selector_named(c"UTF8String")) orelse return;
+        // SAFETY: the cast only retypes the same address as const bytes.
+        let chars = unsafe cast<ptr<const u8>>(utf8);
+        // SAFETY: chars is NUL-terminated, as above.
+        let length = unsafe strlen(chars);
+        // SAFETY: length bytes precede the NUL at chars.
+        let text = unsafe view_from_ptr(chars, cast<i64>(length));
+        print(text);
+    }
+    return;
+}
+
+fn print_ns_error_in_cell(ns_error_cell: ptr<?ptr<u8>>, failure: MetalError) -> MetalError {
+    // SAFETY: ns_error_cell is the 8-byte cell the caller made.
+    let error = unsafe ptr_read(ns_error_cell);
+    // SAFETY: error is nil or an autoreleased NSError Metal wrote, alive until the caller's pool pops.
+    unsafe print_ns_error(error);
+    return failure;
+}
+
+pub fn open_default_gpu() -> MetalError!Gpu {
+    // SAFETY: MTLCreateSystemDefaultDevice takes nothing and returns a retained device or nil.
+    let device = unsafe MTLCreateSystemDefaultDevice() orelse return MetalError::NoDevice;
+    // SAFETY: device was retained above and is not kept on failure.
+    errdefer unsafe release_object(device);
+    // SAFETY: a device answers newCommandQueue with a retained queue or nil.
+    let queue = unsafe send_returning_object(device, selector_named(c"newCommandQueue")) orelse return MetalError::NoQueue;
+    // SAFETY: both objects are retained, as the fields promise.
+    return unsafe Gpu { device: device, queue: queue };
+}
+
+pub fn (self: Gpu) release() -> void {
+    // SAFETY: self holds one reference to each, and is not used after this.
+    unsafe release_object(self.queue);
+    // SAFETY: as above.
+    unsafe release_object(self.device);
+    return;
+}
+
+pub fn (self: &Gpu) compile_library(msl_source: []u8) -> MetalError!Library {
+    // SAFETY: the pool is popped below on every path.
+    let pool = unsafe objc_autoreleasePoolPush();
+    // SAFETY: pool came from the push above.
+    defer unsafe objc_autoreleasePoolPop(pool);
+
+    // SAFETY: the class name is NUL-terminated; Metal links Foundation.
+    let string_class = unsafe objc_getClass(c"NSString") orelse return MetalError::CompileFailed;
+    // SAFETY: a class answers alloc with an uninitialized instance.
+    let blank_string = unsafe send_returning_object(string_class, selector_named(c"alloc")) orelse return MetalError::CompileFailed;
+    // SAFETY: initWithBytes:length:encoding: copies length bytes from the source view, which outlives the call.
+    let init_with_bytes = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<const u8>, u64, u64) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above.
+    let source_string = unsafe init_with_bytes(blank_string, selector_named(c"initWithBytes:length:encoding:"), ptr_of(msl_source), cast<u64>(mem::len(msl_source)), ns_utf8_string_encoding()) orelse return MetalError::CompileFailed;
+    // SAFETY: source_string came from alloc/init above, so this function owns it.
+    defer unsafe release_object(source_string);
+
+    var ns_error_storage = [1]u64{};
+    let ns_error_words = ns_error_storage.as_mut_slice();
+    // SAFETY: the cell is 8 bytes, the size of the NSError pointer Metal writes.
+    let ns_error_cell = unsafe cast<ptr<?ptr<u8>>>(mut_ptr_of(ns_error_words));
+
+    // SAFETY: the class name is NUL-terminated; Metal is linked.
+    let options_class = unsafe objc_getClass(c"MTLCompileOptions") orelse return MetalError::CompileFailed;
+    // SAFETY: a class answers new with a retained instance.
+    let options = unsafe send_returning_object(options_class, selector_named(c"new")) orelse return MetalError::CompileFailed;
+    // SAFETY: options came from new above, so this function owns it.
+    defer unsafe release_object(options);
+    // SAFETY: setFastMathEnabled: takes a BOOL.
+    let set_flag = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, bool) -> void>(objc_msg_send_address());
+    // SAFETY: as above.
+    unsafe set_flag(options, selector_named(c"setFastMathEnabled:"), false);
+
+    // SAFETY: newLibraryWithSource:options:error: takes an NSString, compile options and an out pointer for an autoreleased NSError.
+    let new_library = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>, ptr<u8>, ptr<?ptr<u8>>) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above.
+    let library = unsafe new_library(self.device, selector_named(c"newLibraryWithSource:options:error:"), source_string, options, ns_error_cell) orelse return print_ns_error_in_cell(ns_error_cell, MetalError::CompileFailed);
+    // SAFETY: library is retained by its new... method, as the field promises.
+    return unsafe Library { object: library };
+}
+
+pub fn (self: &Library) kernel(gpu: &Gpu, function_name: ptr<const u8>) -> MetalError!Kernel {
+    // SAFETY: the pool is popped below on every path.
+    let pool = unsafe objc_autoreleasePoolPush();
+    // SAFETY: pool came from the push above.
+    defer unsafe objc_autoreleasePoolPop(pool);
+    // SAFETY: the class name is NUL-terminated; Metal links Foundation.
+    let string_class = unsafe objc_getClass(c"NSString") orelse return MetalError::NoFunction;
+    var ns_error_storage = [1]u64{};
+    let ns_error_words = ns_error_storage.as_mut_slice();
+    // SAFETY: the cell is 8 bytes, the size of the NSError pointer Metal writes.
+    let ns_error_cell = unsafe cast<ptr<?ptr<u8>>>(mut_ptr_of(ns_error_words));
+    // SAFETY: stringWithUTF8String: reads the NUL-terminated name.
+    let string_with_utf8 = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<const u8>) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above; the result is autoreleased into the pool.
+    let name_string = unsafe string_with_utf8(string_class, selector_named(c"stringWithUTF8String:"), function_name) orelse return MetalError::NoFunction;
+    // SAFETY: newFunctionWithName: takes an NSString.
+    let new_function = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above.
+    let function = unsafe new_function(self.object, selector_named(c"newFunctionWithName:"), name_string) orelse return MetalError::NoFunction;
+    // SAFETY: function is retained by its new... method and not kept past here.
+    defer unsafe release_object(function);
+
+    // SAFETY: newComputePipelineStateWithFunction:error: takes the function and an out pointer for an autoreleased NSError.
+    let new_pipeline = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>, ptr<?ptr<u8>>) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above.
+    let pipeline = unsafe new_pipeline(gpu.device, selector_named(c"newComputePipelineStateWithFunction:error:"), function, ns_error_cell) orelse return print_ns_error_in_cell(ns_error_cell, MetalError::PipelineFailed);
+    // SAFETY: a pipeline state answers maxTotalThreadsPerThreadgroup.
+    let max_threads = unsafe send_returning_u64(pipeline, selector_named(c"maxTotalThreadsPerThreadgroup"));
+    // SAFETY: pipeline is retained, as the field promises.
+    return unsafe Kernel { pipeline: pipeline, max_threads_per_threadgroup: max_threads };
+}
+
+pub fn (self: Library) release() -> void {
+    // SAFETY: self holds one reference, and is not used after this.
+    unsafe release_object(self.object);
+    return;
+}
+
+pub fn (self: &Gpu) compile_kernel(msl_source: []u8, function_name: ptr<const u8>) -> MetalError!Kernel {
+    let library = try self.compile_library(msl_source);
+    defer library.release();
+    return try library.kernel(self, function_name);
+}
+
+pub fn (self: Kernel) release() -> void {
+    // SAFETY: self holds one reference, and is not used after this.
+    unsafe release_object(self.pipeline);
+    return;
+}
+
+pub fn (self: &Gpu) new_shared_buffer(byte_count: u64) -> MetalError!Buffer {
+    // SAFETY: newBufferWithLength:options: takes two NSUInteger and returns a retained buffer or nil.
+    let new_buffer = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, u64, u64) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above.
+    let object = unsafe new_buffer(self.device, selector_named(c"newBufferWithLength:options:"), byte_count, mtl_resource_storage_mode_shared()) orelse return MetalError::NoBuffer;
+    // SAFETY: object was retained above and is not kept on failure.
+    errdefer unsafe release_object(object);
+    // SAFETY: a shared buffer answers contents with its bytes.
+    let contents = unsafe send_returning_object(object, selector_named(c"contents")) orelse return MetalError::NoBuffer;
+    // SAFETY: object is retained and contents is its storage of byte_count bytes.
+    return unsafe Buffer { object: object, contents_address: contents, byte_count: byte_count };
+}
+
+pub fn (self: &Gpu) max_buffer_length() -> u64 {
+    // SAFETY: a device answers maxBufferLength with an NSUInteger.
+    return unsafe send_returning_u64(self.device, selector_named(c"maxBufferLength"));
+}
+
+/// The caller keeps byte_count bytes at the page-aligned address readable until the buffer is released.
+pub unsafe fn (self: &Gpu) wrap_shared_bytes(address: ptr<u8>, byte_count: u64) -> MetalError!Buffer {
+    // SAFETY: newBufferWithBytesNoCopy:length:options:deallocator: takes the bytes, two NSUInteger and a nil block.
+    let new_buffer = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>, u64, u64, ?ptr<u8>) -> ?ptr<u8>>(objc_msg_send_address());
+    // SAFETY: as above; the caller keeps the bytes alive.
+    let object = unsafe new_buffer(self.device, selector_named(c"newBufferWithBytesNoCopy:length:options:deallocator:"), address, byte_count, mtl_resource_storage_mode_shared(), null) orelse return MetalError::NoBuffer;
+    // SAFETY: object is retained and wraps the caller's byte_count bytes.
+    return unsafe Buffer { object: object, contents_address: address, byte_count: byte_count };
+}
+
+pub fn (self: &Buffer) contents() -> ptr<u8> {
+    return self.contents_address;
+}
+
+pub fn (self: Buffer) release() -> void {
+    // SAFETY: self holds one reference, and is not used after this.
+    unsafe release_object(self.object);
+    return;
+}
+
+/// Gives up the buffer held here and takes over next.
+pub fn (self: &var Buffer) replace_with(next: Buffer) -> void {
+    // SAFETY: self holds one reference, given up here before next moves in.
+    unsafe release_object(self.object);
+    // SAFETY: next is retained, and its address spans its byte_count bytes.
+    unsafe self.object = next.object;
+    // SAFETY: as above.
+    unsafe self.contents_address = next.contents_address;
+    // SAFETY: as above.
+    unsafe self.byte_count = next.byte_count;
+    return;
+}
+
+pub fn (self: &Gpu) begin_compute_pass() -> MetalError!ComputePass {
+    // SAFETY: the pool is popped below on every path.
+    let pool = unsafe objc_autoreleasePoolPush();
+    // SAFETY: pool came from the push above.
+    defer unsafe objc_autoreleasePoolPop(pool);
+    // SAFETY: a queue answers commandBuffer with an autoreleased buffer.
+    let commands = unsafe send_returning_object(self.queue, selector_named(c"commandBuffer")) orelse return MetalError::EncodeFailed;
+    // SAFETY: a command buffer answers computeCommandEncoder likewise.
+    let encoder = unsafe send_returning_object(commands, selector_named(c"computeCommandEncoder")) orelse return MetalError::EncodeFailed;
+    // SAFETY: both are live until the pool pops; the retains keep them past it.
+    unsafe retain_object(commands);
+    // SAFETY: as above.
+    unsafe retain_object(encoder);
+    // SAFETY: both are retained, as the fields promise.
+    return unsafe ComputePass { commands: commands, encoder: encoder };
+}
+
+pub fn (self: &ComputePass) bind_buffer(index: u64, buffer: &Buffer) -> void {
+    // SAFETY: setBuffer:offset:atIndex: takes a buffer and two NSUInteger.
+    let set_buffer = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>, u64, u64) -> void>(objc_msg_send_address());
+    // SAFETY: as above; the caller keeps the buffer until the pass finishes.
+    unsafe set_buffer(self.encoder, selector_named(c"setBuffer:offset:atIndex:"), buffer.object, 0, index);
+    return;
+}
+
+pub fn (self: &ComputePass) bind_buffer_from(index: u64, buffer: &Buffer, byte_offset: u64) -> void {
+    // SAFETY: setBuffer:offset:atIndex: takes a buffer and two NSUInteger.
+    let set_buffer = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>, u64, u64) -> void>(objc_msg_send_address());
+    // SAFETY: as above; the caller keeps the buffer until the pass finishes and byte_offset lies inside it.
+    unsafe set_buffer(self.encoder, selector_named(c"setBuffer:offset:atIndex:"), buffer.object, byte_offset, index);
+    return;
+}
+
+pub fn (self: &ComputePass) bind_bytes(index: u64, bytes: []u8) -> void {
+    // SAFETY: setBytes:length:atIndex: copies length bytes and takes two NSUInteger.
+    let set_bytes = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<const u8>, u64, u64) -> void>(objc_msg_send_address());
+    // SAFETY: as above; bytes is read during the call only.
+    unsafe set_bytes(self.encoder, selector_named(c"setBytes:length:atIndex:"), ptr_of(bytes), cast<u64>(mem::len(bytes)), index);
+    return;
+}
+
+fn (self: &ComputePass) use_kernel(kernel: &Kernel) -> void {
+    // SAFETY: setComputePipelineState: takes a pipeline state.
+    unsafe send_object_returning_nothing(self.encoder, selector_named(c"setComputePipelineState:"), kernel.pipeline);
+    return;
+}
+
+pub fn (self: &ComputePass) dispatch_threads(kernel: &Kernel, thread_count: u64) -> void {
+    self.use_kernel(kernel);
+    var threadgroup_width = kernel.max_threads_per_threadgroup;
+    if thread_count < threadgroup_width {
+        threadgroup_width = thread_count;
+    }
+    // SAFETY: dispatchThreads:threadsPerThreadgroup: takes two MTLSize; Apple GPUs take a grid that is not a multiple of the threadgroup.
+    unsafe send_two_mtl_sizes(self.encoder, selector_named(c"dispatchThreads:threadsPerThreadgroup:"), MtlSize { width: thread_count, height: 1, depth: 1 }, MtlSize { width: threadgroup_width, height: 1, depth: 1 });
+    return;
+}
+
+pub fn (self: &ComputePass) dispatch_threadgroups(kernel: &Kernel, threadgroup_count: u64, threadgroup_width: u64) -> void {
+    self.use_kernel(kernel);
+    // SAFETY: dispatchThreadgroups:threadsPerThreadgroup: takes two MTLSize.
+    unsafe send_two_mtl_sizes(self.encoder, selector_named(c"dispatchThreadgroups:threadsPerThreadgroup:"), MtlSize { width: threadgroup_count, height: 1, depth: 1 }, MtlSize { width: threadgroup_width, height: 1, depth: 1 });
+    return;
+}
+
+pub fn (self: ComputePass) finish() -> MetalError!void {
+    try self.finish_and_measure_gpu_seconds();
+    return;
+}
+
+pub fn (self: ComputePass) finish_and_measure_gpu_seconds() -> MetalError!f64 {
+    // SAFETY: self holds one reference to each, and is not used after this.
+    defer unsafe release_object(self.encoder);
+    // SAFETY: as above.
+    defer unsafe release_object(self.commands);
+    // SAFETY: each of these takes and returns nothing.
+    unsafe send_returning_nothing(self.encoder, selector_named(c"endEncoding"));
+    // SAFETY: as above.
+    unsafe send_returning_nothing(self.commands, selector_named(c"commit"));
+    // SAFETY: as above.
+    unsafe send_returning_nothing(self.commands, selector_named(c"waitUntilCompleted"));
+    // SAFETY: a command buffer answers status with an NSUInteger.
+    let status = unsafe send_returning_u64(self.commands, selector_named(c"status"));
+    if status != mtl_command_buffer_status_completed() {
+        // SAFETY: a command buffer answers error with nil or an NSError.
+        let error = unsafe send_returning_object(self.commands, selector_named(c"error"));
+        // SAFETY: error is nil or an NSError the command buffer holds.
+        unsafe print_ns_error(error);
+        return MetalError::KernelFailed;
+    }
+    // SAFETY: a command buffer answers GPUStartTime with a CFTimeInterval.
+    let start = unsafe send_returning_f64(self.commands, selector_named(c"GPUStartTime"));
+    // SAFETY: likewise GPUEndTime.
+    let end = unsafe send_returning_f64(self.commands, selector_named(c"GPUEndTime"));
+    return end - start;
+}

@@ -1,0 +1,146 @@
+import kizukani::metal;
+import std::float;
+import std::fs;
+import std::io;
+import std::mem;
+import std::rand;
+import std::string;
+import std::testing;
+
+fn generated_kernel_source(allocator: Allocator) -> !string::String {
+    let path = "target/kernels.metal";
+    return fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+}
+
+fn bind_i64_pair(pass: &metal::ComputePass, index: u64, first: i64, second: i64) -> void {
+    let words = [2]i64{ first, second };
+    let word_view = words.as_slice();
+    // SAFETY: the two words are sixteen readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(word_view));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, 16);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn fill_floats(buffer: &metal::Buffer, count: i64, seed: i64) -> void {
+    // SAFETY: the buffer holds count f32, and no GPU work uses it yet.
+    let values = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(buffer.contents()), count);
+    var random = rand::new(seed);
+    for 0..count |index| {
+        values[index] = float::from_bits_f32(cast<u32>(random.below(4294967296)));
+    }
+    return;
+}
+
+fn copy_floats(from: &metal::Buffer, to: &metal::Buffer, count: i64) -> void {
+    // SAFETY: both buffers hold count f32, and no GPU work uses them yet.
+    let source = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(from.contents()), count);
+    // SAFETY: as above.
+    let target = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(to.contents()), count);
+    for 0..count |index| {
+        target[index] = source[index];
+    }
+    return;
+}
+
+fn status_word(buffer: &metal::Buffer) -> u32 {
+    // SAFETY: the status buffer holds one u32, and the pass that wrote it finished.
+    let words = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(buffer.contents()), 1);
+    return words[0];
+}
+
+fn clear_status(buffer: &metal::Buffer) -> void {
+    // SAFETY: the status buffer holds one u32, and no GPU work uses it yet.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(buffer.contents()), 1);
+    words[0] = 0;
+    return;
+}
+
+test "the add_residual kernel matches the cpu rounding bit for bit" {
+    let allocator = mem::page_allocator();
+    let source = try generated_kernel_source(allocator);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let generated_library = try gpu.compile_library(source_bytes);
+    defer generated_library.release();
+    let generated = try generated_library.kernel(&gpu, c"add_residual");
+    defer generated.release();
+
+    let count: i64 = 65536;
+    let byte_count = cast<u64>(count * 4);
+    let hidden_generated = try gpu.new_shared_buffer(byte_count);
+    defer hidden_generated.release();
+    let hidden_before = try gpu.new_shared_buffer(byte_count);
+    defer hidden_before.release();
+    let projected = try gpu.new_shared_buffer(byte_count);
+    defer projected.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    fill_floats(&hidden_generated, count, 5);
+    fill_floats(&projected, count, 6);
+    copy_floats(&hidden_generated, &hidden_before, count);
+    clear_status(&status);
+
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &hidden_generated);
+    pass.bind_buffer(1, &projected);
+    let width_words = [1]i64{ count };
+    let width_view = width_words.as_slice();
+    bind_i64_values(&pass, 2, width_view);
+    bind_i64_pair(&pass, 3, count, count);
+    pass.bind_buffer(4, &status);
+    pass.dispatch_threads(&generated, cast<u64>(count));
+    try pass.finish();
+
+    testing::expect_equal<u32>(0, status_word(&status));
+    // SAFETY: the pass finished, and the buffer holds count u32.
+    let got = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(hidden_generated.contents()), count);
+    // SAFETY: the pass finished, and the buffer holds count f32.
+    let before = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(hidden_before.contents()), count);
+    // SAFETY: the pass finished, and the buffer holds count f32.
+    let added = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(projected.contents()), count);
+    var mismatches: i64 = 0;
+    for 0..count |index| {
+        let expected = round_to_bf16(flushed(flushed(before[index]) + flushed(round_to_bf16(added[index]))));
+        if !same_float_bits(got[index], float::bits_f32(expected)) {
+            mismatches = mismatches + 1;
+        }
+    }
+    testing::expect_equal<i64>(0, mismatches);
+}
+
+test "a kizu kernel that indexes past a view reports it through the status word" {
+    let allocator = mem::page_allocator();
+    let source = try generated_kernel_source(allocator);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let kernel = try library.kernel(&gpu, c"add_residual");
+    defer kernel.release();
+    let hidden = try gpu.new_shared_buffer(64);
+    defer hidden.release();
+    let projected = try gpu.new_shared_buffer(64);
+    defer projected.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    fill_floats(&hidden, 16, 7);
+    fill_floats(&projected, 16, 8);
+    clear_status(&status);
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &hidden);
+    pass.bind_buffer(1, &projected);
+    let width_words = [1]i64{ 16 };
+    let width_view = width_words.as_slice();
+    bind_i64_values(&pass, 2, width_view);
+    bind_i64_pair(&pass, 3, 16, 8);
+    pass.bind_buffer(4, &status);
+    pass.dispatch_threads(&kernel, 16);
+    try pass.finish();
+    testing::expect_equal<u32>(1, status_word(&status));
+}

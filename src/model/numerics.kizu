@@ -1,0 +1,126 @@
+import kizukani::yskn;
+import std::math;
+import std::mem;
+
+pub fn round_to_bf16(value: f32) -> f32 {
+    let bits = yskn::binary32_bits(value);
+    if (bits & 0x7f800000) == 0x7f800000 {
+        return value;
+    }
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    return yskn::binary32_from_bits((bits + rounding) & 0xffff0000);
+}
+
+pub fn round_to_f16(value: f32) -> f32 {
+    let bits = yskn::binary32_bits(value);
+    let sign = bits & 0x80000000;
+    let magnitude = bits & 0x7fffffff;
+    if magnitude >= 0x7f800000 {
+        return value;
+    }
+    if magnitude >= 0x477ff000 {
+        return yskn::binary32_from_bits(sign | 0x7f800000);
+    }
+    if magnitude < 0x38800000 {
+        let units = math::round_even<f32>(yskn::binary32_from_bits(magnitude) * cast<f32>(16777216.0));
+        return yskn::binary32_from_bits(sign | yskn::binary32_bits(units * yskn::binary32_from_bits(0x33800000)));
+    }
+    let rounding = 0xfff + ((magnitude >> 13) & 1);
+    return yskn::binary32_from_bits(sign | ((magnitude + rounding) & 0xffffe000));
+}
+
+pub fn reciprocal_square_root(value: f32) -> f32 {
+    return cast<f32>(1.0) / math::sqrt<f32>(value);
+}
+
+pub fn sigmoid(value: f32) -> f32 {
+    let wide = cast<f64>(value);
+    return cast<f32>(1.0 / (1.0 + math::exp<f64>(-wide)));
+}
+
+pub fn silu(value: f32) -> f32 {
+    return value * sigmoid(value);
+}
+
+pub fn softplus(value: f32) -> f32 {
+    if value > cast<f32>(20.0) {
+        return value;
+    }
+    return cast<f32>(math::log1p<f64>(math::exp<f64>(cast<f64>(value))));
+}
+
+pub fn exponential(value: f32) -> f32 {
+    return cast<f32>(math::exp<f64>(cast<f64>(value)));
+}
+
+pub fn hadamard_width() -> i64 {
+    return 512;
+}
+
+pub fn inverse_sqrt_hadamard_width() -> f32 {
+    return yskn::binary32_from_bits(0x3d3504f3);
+}
+
+pub fn unnormalized_hadamard_in_place(values: &var []f32, first: i64) -> void {
+    var half_width: i64 = 1;
+    while half_width < hadamard_width() {
+        var base: i64 = 0;
+        while base < hadamard_width() {
+            for 0..half_width |offset| {
+                let lower_index = first + base + offset;
+                let upper_index = lower_index + half_width;
+                let lower = values[lower_index];
+                let upper = values[upper_index];
+                values[lower_index] = lower + upper;
+                values[upper_index] = lower - upper;
+            }
+            base = base + 2 * half_width;
+        }
+        half_width = half_width * 2;
+    }
+    return;
+}
+
+pub fn sum_of_squares_in_reference_order(values: []f32) -> f32 {
+    var total: f32 = 0.0;
+    let count = mem::count<f32>(values);
+    var block_start: i64 = 0;
+    while block_start < count {
+        var partial = [128]f32{};
+        let partial_view = partial.as_mut_slice();
+        for 0..128 |index| {
+            var sum: f32 = 0.0;
+            for 0..4 |group| {
+                let value = values[block_start + index + 128 * group];
+                sum = sum + value * value;
+            }
+            partial_view[index] = sum;
+        }
+        for 0..4 |group| {
+            total = total + xor_reduce_32(partial_view, group * 32);
+        }
+        block_start = block_start + 512;
+    }
+    return total;
+}
+
+pub fn xor_reduce_32(values: []f32, first: i64) -> f32 {
+    var lanes = [32]f32{};
+    let lane_view = lanes.as_mut_slice();
+    for 0..32 |lane| {
+        lane_view[lane] = values[first + lane];
+    }
+    var offset: i64 = 16;
+    while offset >= 1 {
+        var previous = [32]f32{};
+        let previous_view = previous.as_mut_slice();
+        for 0..32 |lane| {
+            previous_view[lane] = lane_view[lane];
+        }
+        for 0..32 |lane| {
+            lane_view[lane] = previous_view[lane] + previous_view[lane ^ offset];
+        }
+        offset = offset / 2;
+    }
+    return lane_view[0];
+}

@@ -1,0 +1,21 @@
+import std::mem;
+import std::testing;
+
+test "mapping the fixture shows its magic and length" {
+    let mapped = try map_read_only(c"testdata/tiny.yskn");
+    defer mapped.release();
+    testing::expect_equal<i64>(468304, mapped.length());
+    // SAFETY: the mapping holds length() bytes until release.
+    let file = unsafe view_from_ptr(mapped.first_byte(), mapped.length());
+    let magic = file[0..4];
+    testing::expect(mem::equal_bytes(magic, "YSKN"));
+}
+
+test "mapping a missing file is OpenFailed" {
+    if map_read_only(c"testdata/no-such-file") |mapped| {
+        mapped.release();
+        testing::fail("mapped a missing file");
+    } else |failure| {
+        testing::expect_equal<MapError>(MapError::OpenFailed, failure);
+    }
+}

@@ -1,0 +1,207 @@
+import std::float;
+import std::gpu;
+
+fn attention_head_width() -> i64 {
+    return 256;
+}
+
+fn rotary_pairs() -> i64 {
+    return 32;
+}
+
+fn normalize_and_rotate_head(
+    value: f32,
+    norm_weight: []f32,
+    rotary: []f32,
+    channel: i64,
+    head_values: &var []f32,
+    group_sums: &var []f32
+) -> f32 {
+    let square = xor_reduce_32(value * value);
+    if gpu::lane_index() == 0 {
+        group_sums[gpu::simdgroup_index()] = square;
+    }
+    gpu::barrier();
+    var square_sum: f32 = 0.0;
+    for 0..(attention_head_width() / 32) |group| {
+        square_sum = square_sum + group_sums[group];
+    }
+    let inverse_rms = one() / gpu::sqrt(square_sum / cast<f32>(attention_head_width()) + model_epsilon());
+    let normalized = round_to_bf16((value * inverse_rms) * (one() + norm_weight[channel]));
+    head_values[channel] = normalized;
+    gpu::barrier();
+    var result = normalized;
+    let pairs = rotary_pairs();
+    if channel < pairs {
+        let low = head_values[channel];
+        let high = head_values[channel + pairs];
+        result = round_to_bf16(round_to_bf16(low * rotary[channel]) + round_to_bf16(-high * rotary[pairs + channel]));
+    } else {
+        if channel < 2 * pairs {
+            let pair = channel - pairs;
+            let low = head_values[pair];
+            let high = head_values[channel];
+            result = round_to_bf16(round_to_bf16(high * rotary[pair]) + round_to_bf16(low * rotary[pairs + pair]));
+        }
+    }
+    gpu::barrier();
+    return result;
+}
+
+export "gpu" fn attention_keys(
+    projected_keys: []f32,
+    projected_values: []f32,
+    key_norm: []f32,
+    rotary: []f32,
+    key_cache: &var []f32,
+    value_cache: &var []f32,
+    position: i64,
+    cache_first: i64
+) -> void {
+    var head_storage = gpu::group_array<[256]f32>();
+    var sum_storage = gpu::group_array<[8]f32>();
+    var head_values = head_storage.as_mut_slice();
+    var group_sums = sum_storage.as_mut_slice();
+    let channel = gpu::local_index();
+    let token = gpu::group_index() / attention_key_value_heads();
+    let index = (gpu::group_index() % attention_key_value_heads()) * attention_head_width() + channel;
+    let rotary_first = token * 2 * rotary_pairs();
+    let token_rotary = rotary[rotary_first..rotary_first + 2 * rotary_pairs()];
+    let source = token * slot_values() + index;
+    let key = normalize_and_rotate_head(round_to_bf16(projected_keys[source]), key_norm, token_rotary, channel, &var head_values, &var group_sums);
+    let cached = cache_first + (position + token) * 1024 + index;
+    key_cache[cached] = key;
+    value_cache[cached] = round_to_bf16(projected_values[source]);
+    return;
+}
+
+export "gpu" fn attention_queries(
+    projected_queries_and_gates: []f32,
+    query_norm: []f32,
+    rotary: []f32,
+    queries: &var []f32
+) -> void {
+    var head_storage = gpu::group_array<[256]f32>();
+    var sum_storage = gpu::group_array<[8]f32>();
+    var head_values = head_storage.as_mut_slice();
+    var group_sums = sum_storage.as_mut_slice();
+    let token = gpu::group_index() / attention_query_heads();
+    let head = gpu::group_index() % attention_query_heads();
+    let channel = gpu::local_index();
+    let width = attention_head_width();
+    let rotary_first = token * 2 * rotary_pairs();
+    let token_rotary = rotary[rotary_first..rotary_first + 2 * rotary_pairs()];
+    let query = round_to_bf16(projected_queries_and_gates[token * slot_values() + 2 * head * width + channel]);
+    queries[token * query_stride() + head * width + channel] = normalize_and_rotate_head(query, query_norm, token_rotary, channel, &var head_values, &var group_sums);
+    return;
+}
+
+fn attention_query_heads() -> i64 {
+    return 24;
+}
+
+fn query_heads_per_key_value_head() -> i64 {
+    return 6;
+}
+
+fn attention_key_value_width() -> i64 {
+    return 1024;
+}
+
+fn attention_key_value_heads() -> i64 {
+    return 4;
+}
+
+fn query_stride() -> i64 {
+    return attention_query_heads() * attention_head_width();
+}
+
+export "gpu" fn attention_scores(
+    queries: []f32,
+    key_cache: []f32,
+    scores: &var []f32,
+    position: i64,
+    cache_first: i64,
+    maximum_positions: i64,
+    token_count: i64
+) -> void {
+    let id = gpu::thread_index();
+    let span = position + token_count;
+    let token = id / (attention_query_heads() * span);
+    let rest = id % (attention_query_heads() * span);
+    let head = rest / span;
+    let past = rest % span;
+    if token >= token_count or past > position + token {
+        return;
+    }
+    let key_value_head = head / query_heads_per_key_value_head();
+    let width = attention_head_width();
+    let key_first = cache_first + past * attention_key_value_width() + key_value_head * width;
+    let query_first = token * query_stride() + head * width;
+    var dot: f32 = 0.0;
+    for 0..width |channel| {
+        dot = dot + queries[query_first + channel] * key_cache[key_first + channel];
+    }
+    scores[(token * attention_query_heads() + head) * maximum_positions + past] = dot * float::from_bits_f32(0x3d800000);
+    return;
+}
+
+export "gpu" fn attention_weights(
+    scores: &var []f32,
+    weight_sums: &var []f32,
+    position: i64,
+    maximum_positions: i64,
+    token_count: i64
+) -> void {
+    let id = gpu::thread_index();
+    let token = id / attention_query_heads();
+    if token >= token_count {
+        return;
+    }
+    let positions = position + token + 1;
+    let first = id * maximum_positions;
+    var maximum = -float::from_bits_f32(0x7149f2ca);
+    for 0..positions |past| {
+        if scores[first + past] > maximum {
+            maximum = scores[first + past];
+        }
+    }
+    var sum: f32 = 0.0;
+    for 0..positions |past| {
+        let weight = gpu::exp(scores[first + past] - maximum);
+        scores[first + past] = weight;
+        sum = sum + weight;
+    }
+    weight_sums[id] = sum;
+    return;
+}
+
+export "gpu" fn attention_output(
+    weights: []f32,
+    weight_sums: []f32,
+    value_cache: []f32,
+    projected_queries_and_gates: []f32,
+    gated: &var []f32,
+    position: i64,
+    cache_first: i64,
+    maximum_positions: i64
+) -> void {
+    let id = gpu::thread_index();
+    let width = attention_head_width();
+    let token = id / query_stride();
+    let rest = id % query_stride();
+    let head = rest / width;
+    let channel = rest % width;
+    let key_value_head = head / query_heads_per_key_value_head();
+    let positions = position + token + 1;
+    let weight_first = (token * attention_query_heads() + head) * maximum_positions;
+    let value_first = cache_first + key_value_head * width + channel;
+    var accumulated: f32 = 0.0;
+    for 0..positions |past| {
+        accumulated = accumulated + weights[weight_first + past] * value_cache[value_first + past * attention_key_value_width()];
+    }
+    let attended = round_to_bf16(accumulated / weight_sums[token * attention_query_heads() + head]);
+    let gate = round_to_bf16(sigmoid_of(round_to_bf16(projected_queries_and_gates[token * slot_values() + (2 * head + 1) * width + channel])));
+    gated[token * activation_stride() + rest] = round_to_bf16(attended * gate);
+    return;
+}

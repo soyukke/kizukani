@@ -1,0 +1,353 @@
+import std::float;
+import std::gpu;
+
+fn draft_width() -> i64 {
+    return 5120;
+}
+
+fn draft_heads() -> i64 {
+    return 32;
+}
+
+fn draft_kv_heads() -> i64 {
+    return 8;
+}
+
+fn draft_window() -> i64 {
+    return 2048;
+}
+
+fn draft_rows() -> i64 {
+    return 8;
+}
+
+fn draft_span() -> i64 {
+    return draft_window() + draft_rows();
+}
+
+fn draft_scale() -> f32 {
+    return float::from_bits_f32(0x3db504f3);
+}
+
+fn negative_huge() -> f32 {
+    return -float::from_bits_f32(0x7f7fffff);
+}
+
+export "gpu" fn draft_norm(input: []f32, weight: []f32, output: &var []f32, width: i64, input_stride: i64, output_stride: i64) -> void {
+    var sum_storage = gpu::group_array<[8]f32>();
+    var sums = sum_storage.as_mut_slice();
+    var total_storage = gpu::group_array<[1]f32>();
+    var totals = total_storage.as_mut_slice();
+    let row = gpu::group_index();
+    let lane = gpu::local_index();
+    let first = row * input_stride;
+    var partial: f32 = 0.0;
+    var index = lane;
+    while index < width {
+        let value = input[first + index];
+        partial = gpu::fma(value, value, partial);
+        index = index + 256;
+    }
+    let reduced = xor_reduce_32(partial);
+    if gpu::lane_index() == 0 {
+        sums[gpu::simdgroup_index()] = reduced;
+    }
+    gpu::barrier();
+    if lane == 0 {
+        var total: f32 = 0.0;
+        for 0..8 |group| {
+            total = total + sums[group];
+        }
+        totals[0] = one() / gpu::sqrt(total / cast<f32>(width) + model_epsilon());
+    }
+    gpu::barrier();
+    let inverse = totals[0];
+    index = lane;
+    while index < width {
+        output[row * output_stride + index] = (inverse * input[first + index]) * weight[index];
+        index = index + 256;
+    }
+    return;
+}
+
+export "gpu" fn draft_filter(
+    source: []f32,
+    dynamic: []f32,
+    bases: []f32,
+    target: &var []f32,
+    branch: i64,
+    accumulate: u32,
+    source_stride: i64,
+    dynamic_stride: i64,
+    target_stride: i64,
+    row_count: i64
+) -> void {
+    let id = gpu::thread_index();
+    let width = draft_width();
+    let row = id / width;
+    let channel = id % width;
+    if row >= row_count {
+        return;
+    }
+    let group = channel / 16;
+    let first = row * dynamic_stride + branch * 640;
+    let current = bases[2 * branch * width + channel] + dynamic[first + group];
+    var value = current * source[row * source_stride + channel];
+    if row > 0 {
+        let previous = bases[(2 * branch + 1) * width + channel] + dynamic[first + 320 + group];
+        value = value + previous * source[(row - 1) * source_stride + channel];
+    }
+    let at = row * target_stride + channel;
+    if accumulate != 0 {
+        target[at] = target[at] + value;
+    } else {
+        target[at] = value;
+    }
+    return;
+}
+
+export "gpu" fn draft_rope(values: &var []f32, weight: []f32, table: []f32, heads: i64, stride: i64) -> void {
+    var head_storage = gpu::group_array<[128]f32>();
+    var head = head_storage.as_mut_slice();
+    var sum_storage = gpu::group_array<[4]f32>();
+    var sums = sum_storage.as_mut_slice();
+    let row = gpu::group_index() / heads;
+    let head_index = gpu::group_index() % heads;
+    let channel = gpu::local_index();
+    let at = row * stride + head_index * 128 + channel;
+    let value = values[at];
+    let reduced = xor_reduce_32(value * value);
+    if gpu::lane_index() == 0 {
+        sums[gpu::simdgroup_index()] = reduced;
+    }
+    gpu::barrier();
+    let total = ((sums[0] + sums[1]) + sums[2]) + sums[3];
+    let inverse = one() / gpu::sqrt(total / cast<f32>(128) + model_epsilon());
+    head[channel] = (inverse * value) * weight[channel];
+    gpu::barrier();
+    let pair = channel % 64;
+    let cosine = table[row * 128 + pair];
+    let sine = table[row * 128 + 64 + pair];
+    if channel < 64 {
+        values[at] = head[channel] * cosine - head[channel + 64] * sine;
+    } else {
+        values[at] = head[channel] * cosine + head[channel - 64] * sine;
+    }
+    return;
+}
+
+export "gpu" fn draft_scores(
+    queries: []f32,
+    keys: []f32,
+    ring_keys: []f32,
+    scores: &var []f32,
+    position: i64,
+    history_start: i64,
+    history_count: i64,
+    query_stride: i64,
+    key_stride: i64
+) -> void {
+    let id = gpu::thread_index();
+    let span = history_count + draft_rows();
+    let row = id / (draft_heads() * span);
+    let rest = id % (draft_heads() * span);
+    let head = rest / span;
+    let past = rest % span;
+    if row >= draft_rows() {
+        return;
+    }
+    let kv = head / (draft_heads() / draft_kv_heads());
+    let query_first = row * query_stride + head * 128;
+    var dot: f32 = 0.0;
+    var masked = false;
+    if past < history_count {
+        let absolute = history_start + past;
+        if absolute + draft_window() - 1 < position + row {
+            masked = true;
+        }
+        let key_first = (kv * draft_window() + absolute % draft_window()) * 128;
+        for 0..128 |channel| {
+            dot = gpu::fma(queries[query_first + channel], ring_keys[key_first + channel], dot);
+        }
+    } else {
+        let key_first = (past - history_count) * key_stride + kv * 128;
+        for 0..128 |channel| {
+            dot = gpu::fma(queries[query_first + channel], keys[key_first + channel], dot);
+        }
+    }
+    var score = dot * draft_scale();
+    if masked {
+        score = negative_huge();
+    }
+    scores[(row * draft_heads() + head) * draft_span() + past] = score;
+    return;
+}
+
+export "gpu" fn draft_softmax(scores: &var []f32, sums: &var []f32, history_count: i64) -> void {
+    let id = gpu::thread_index();
+    if id >= draft_rows() * draft_heads() {
+        return;
+    }
+    let span = history_count + draft_rows();
+    let first = id * draft_span();
+    var maximum = negative_huge();
+    for 0..span |past| {
+        maximum = larger(maximum, scores[first + past]);
+    }
+    var total: f32 = 0.0;
+    for 0..span |past| {
+        var weight: f32 = 0.0;
+        if scores[first + past] > negative_huge() {
+            weight = gpu::exp(scores[first + past] - maximum);
+        }
+        scores[first + past] = weight;
+        total = total + weight;
+    }
+    sums[id] = total;
+    return;
+}
+
+export "gpu" fn draft_attend(
+    weights: []f32,
+    sums: []f32,
+    ring_values: []f32,
+    values: []f32,
+    attended: &var []f32,
+    history_start: i64,
+    history_count: i64,
+    value_stride: i64,
+    attended_stride: i64
+) -> void {
+    let id = gpu::thread_index();
+    let row = id / (draft_heads() * 128);
+    let rest = id % (draft_heads() * 128);
+    let head = rest / 128;
+    let channel = rest % 128;
+    if row >= draft_rows() {
+        return;
+    }
+    let kv = head / (draft_heads() / draft_kv_heads());
+    let first = (row * draft_heads() + head) * draft_span();
+    var total: f32 = 0.0;
+    for 0..history_count |past| {
+        let absolute = history_start + past;
+        total = gpu::fma(weights[first + past], ring_values[(kv * draft_window() + absolute % draft_window()) * 128 + channel], total);
+    }
+    for 0..draft_rows() |block_row| {
+        total = gpu::fma(weights[first + history_count + block_row], values[block_row * value_stride + kv * 128 + channel], total);
+    }
+    attended[row * attended_stride + rest] = total / sums[row * draft_heads() + head];
+    return;
+}
+
+export "gpu" fn draft_glu(gates: []f32, ups: []f32, product: &var []f32, width: i64, source_stride: i64, target_stride: i64) -> void {
+    let id = gpu::thread_index();
+    let row = id / width;
+    let index = id % width;
+    if row >= draft_rows() {
+        return;
+    }
+    let gate = gates[row * source_stride + index];
+    product[row * target_stride + index] = (gate / (one() + gpu::exp(-gate))) * ups[row * source_stride + index];
+    return;
+}
+
+export "gpu" fn draft_ring_write(
+    keys: []f32,
+    values: []f32,
+    ring_keys: &var []f32,
+    ring_values: &var []f32,
+    position: i64,
+    row_count: i64,
+    stride: i64
+) -> void {
+    let id = gpu::thread_index();
+    let row = id / 1024;
+    let rest = id % 1024;
+    if row >= row_count {
+        return;
+    }
+    let kv = rest / 128;
+    let channel = rest % 128;
+    let at = (kv * draft_window() + (position + row) % draft_window()) * 128 + channel;
+    ring_keys[at] = round_to_bf16(keys[row * stride + rest]);
+    ring_values[at] = round_to_bf16(values[row * stride + rest]);
+    return;
+}
+
+export "gpu" fn copy_rows(source: []f32, target: &var []f32, width: i64, source_stride: i64, target_stride: i64, row_count: i64) -> void {
+    let id = gpu::thread_index();
+    let row = id / width;
+    let index = id % width;
+    if row >= row_count {
+        return;
+    }
+    target[row * target_stride + index] = source[row * source_stride + index];
+    return;
+}
+
+export "gpu" fn head_project(hidden: []f32, projection: []f32, low_rank: &var []f32, row_count: i64) -> void {
+    let id = gpu::thread_index();
+    let row = id / 512;
+    let rank = id % 512;
+    if row >= row_count {
+        return;
+    }
+    var total: f32 = 0.0;
+    for 0..draft_width() |index| {
+        total = gpu::fma(hidden[row * draft_width() + index], projection[rank * draft_width() + index], total);
+    }
+    low_rank[id] = total;
+    return;
+}
+
+export "gpu" fn head_approximate(low_rank: []f32, weights: []i8, scales: []f32, scores: &var []f32, vocabulary: i64, row_count: i64) -> void {
+    let token = gpu::thread_index();
+    if token >= vocabulary {
+        return;
+    }
+    let first = token * 512;
+    let row_weights = weights[first..first + 512];
+    for 0..7 |row| {
+        if row < row_count {
+            var total: f32 = 0.0;
+            for 0..512 |index| {
+                total = gpu::fma(low_rank[row * 512 + index], cast<f32>(row_weights[index]), total);
+            }
+            scores[row * vocabulary + token] = total * scales[token];
+        }
+    }
+    return;
+}
+
+export "gpu" fn head_rescore(hidden: []f32, candidates: []i64, weights: []i8, scales: []f32, scores: &var []f32, row_count: i64) -> void {
+    let id = gpu::thread_index();
+    let row = id / 512;
+    if row >= row_count {
+        return;
+    }
+    let token = candidates[id];
+    let first = token * draft_width();
+    let row_weights = weights[first..first + draft_width()];
+    var total: f32 = 0.0;
+    for 0..draft_width() |index| {
+        total = gpu::fma(hidden[row * draft_width() + index], cast<f32>(row_weights[index]), total);
+    }
+    scores[id] = total * scales[token];
+    return;
+}
+
+export "gpu" fn head_correction(hidden: []f32, projection: []f32, feature: &var []f32, row_count: i64) -> void {
+    let id = gpu::thread_index();
+    let row = id / 256;
+    let rank = id % 256;
+    if row >= row_count {
+        return;
+    }
+    var total: f32 = 0.0;
+    for 0..draft_width() |index| {
+        total = gpu::fma(hidden[row * draft_width() + index], projection[rank * draft_width() + index], total);
+    }
+    feature[id] = total;
+    return;
+}

@@ -1,0 +1,29 @@
+import kizukani::text;
+import std::fs;
+import std::io;
+import std::mem;
+import std::process;
+
+pub fn run_tokenizer_check(path: []u8) -> !void {
+    let allocator = mem::page_allocator();
+    let load_started = process::unix_millis();
+    let tokenizer = try text::load_tokenizer(allocator, "data/unicode_tables.bin", "models/qwen38-27b-speed/tokenizer.json");
+    defer tokenizer.deinit(allocator);
+    print("load milliseconds:");
+    print(process::unix_millis() - load_started);
+    let fixture = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer fixture.deinit(allocator);
+    let fixture_bytes = fixture.as_bytes();
+    let started = process::unix_millis();
+    var mismatches: i64 = 0;
+    if mem::len(fixture_bytes) > 2 and fixture_bytes[1] == 9 and (fixture_bytes[0] == 48 or fixture_bytes[0] == 49) {
+        mismatches = try tokenizer.count_chat_mismatches(allocator, fixture_bytes);
+    } else {
+        mismatches = try tokenizer.count_fixture_mismatches(allocator, fixture_bytes);
+    }
+    print("check milliseconds:");
+    print(process::unix_millis() - started);
+    print("tokenizer check passed:");
+    print(mismatches == 0);
+    return;
+}

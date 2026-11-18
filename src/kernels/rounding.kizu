@@ -1,0 +1,114 @@
+import std::float;
+import std::gpu;
+
+fn round_to_bf16(value: f32) -> f32 {
+    let bits = float::bits_f32(value);
+    if (bits & 0x7f800000) == 0x7f800000 {
+        return value;
+    }
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    return float::from_bits_f32((bits + rounding) & 0xffff0000);
+}
+
+fn absolute(value: f32) -> f32 {
+    return float::from_bits_f32(float::bits_f32(value) & 0x7fffffff);
+}
+
+fn larger(left: f32, right: f32) -> f32 {
+    if right > left {
+        return right;
+    }
+    return left;
+}
+
+fn two_to_the_23() -> f32 {
+    return float::from_bits_f32(0x4b000000);
+}
+
+fn round_half_even(value: f32) -> f32 {
+    let magnitude = absolute(value);
+    if !(magnitude < two_to_the_23()) {
+        return value;
+    }
+    let rounded = (magnitude + two_to_the_23()) - two_to_the_23();
+    if float::bits_f32(value) >= 0x80000000 {
+        return -rounded;
+    }
+    return rounded;
+}
+
+fn round_to_f16(value: f32) -> f32 {
+    let bits = float::bits_f32(value);
+    let sign = bits & 0x80000000;
+    let magnitude = bits & 0x7fffffff;
+    if magnitude >= 0x7f800000 {
+        return value;
+    }
+    if magnitude >= 0x477ff000 {
+        return float::from_bits_f32(sign | 0x7f800000);
+    }
+    if magnitude < 0x38800000 {
+        let units = round_half_even(float::from_bits_f32(magnitude) * float::from_bits_f32(0x4b800000));
+        return float::from_bits_f32(sign | float::bits_f32(units * float::from_bits_f32(0x33800000)));
+    }
+    let rounding = 0xfff + ((magnitude >> 13) & 1);
+    return float::from_bits_f32(sign | ((magnitude + rounding) & 0xffffe000));
+}
+
+fn one() -> f32 {
+    return float::from_bits_f32(0x3f800000);
+}
+
+fn model_epsilon() -> f32 {
+    return float::from_bits_f32(0x358637bd);
+}
+
+fn sigmoid_of(value: f32) -> f32 {
+    return one() / (one() + gpu::exp(-value));
+}
+
+fn silu_of(value: f32) -> f32 {
+    return value * sigmoid_of(value);
+}
+
+fn softplus_of(value: f32) -> f32 {
+    if value > float::from_bits_f32(0x41a00000) {
+        return value;
+    }
+    return gpu::log(one() + gpu::exp(value));
+}
+
+fn xor_reduce_32(value: f32) -> f32 {
+    var total = value;
+    var offset: i64 = 16;
+    while offset >= 1 {
+        total = total + gpu::shuffle_xor(total, offset);
+        offset = offset / 2;
+    }
+    return total;
+}
+
+fn hadamard_in_group(values: &var []f32, thread_in_group: i64) -> void {
+    let thread_word = cast<u32>(thread_in_group);
+    var half_width: u32 = 1;
+    while half_width < 512 {
+        gpu::barrier();
+        if thread_word < 256 {
+            let below = thread_word & (half_width - 1);
+            let lower_word = (thread_word - below) * 2 + below;
+            let lower = cast<i64>(lower_word);
+            let upper = cast<i64>(lower_word + half_width);
+            let low = values[lower];
+            let high = values[upper];
+            values[lower] = low + high;
+            values[upper] = low - high;
+        }
+        half_width = half_width * 2;
+    }
+    gpu::barrier();
+    return;
+}
+
+fn inverse_sqrt_hadamard_width() -> f32 {
+    return float::from_bits_f32(0x3d3504f3);
+}

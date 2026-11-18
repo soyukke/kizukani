@@ -1,0 +1,306 @@
+import std::array;
+import std::crypto;
+import std::fs;
+import std::io;
+import std::json;
+import std::mem;
+import std::string;
+import std::testing;
+
+struct Fixture {
+    file: string::String,
+    expected: json::Value,
+}
+
+fn load_fixture(allocator: Allocator) -> !Fixture {
+    let blocking = io::blocking();
+    let file = try fs::read_file(blocking, allocator, "testdata/tiny.yskn", mem::Limit::Unlimited);
+    errdefer file.deinit(allocator);
+    let expected_text = try fs::read_file(blocking, allocator, "testdata/tiny_expected.json", mem::Limit::Unlimited);
+    defer expected_text.deinit(allocator);
+    let expected_bytes = expected_text.as_bytes();
+    let expected = try json::decode<json::Value>(allocator, expected_bytes);
+    return Fixture { file: move file, expected: move expected };
+}
+
+fn append_lowercase_hex_sha256(allocator: Allocator, out: &var string::String, bytes: []u8) -> mem::Error!void {
+    var digest = [32]u8{};
+    let digest_view = digest.as_mut_bytes();
+    crypto::sha256(bytes, digest_view);
+    let digits = "0123456789abcdef";
+    let digest_bytes = digest.as_bytes();
+    for 0..32 |index| {
+        let value = cast<i64>(digest_bytes[index]);
+        try out.append_byte(allocator, digits[value >> 4]);
+        try out.append_byte(allocator, digits[value & 15]);
+    }
+    return;
+}
+
+fn expect_member_is_sha256_of(allocator: Allocator, object: &json::Value, key: []u8, bytes: []u8) -> !void {
+    var hex = string::new(allocator);
+    defer hex.deinit(allocator);
+    try append_lowercase_hex_sha256(allocator, &var hex, bytes);
+    let hex_bytes = hex.as_bytes();
+    testing::expect(try text_equals(object, key, hex_bytes, ""));
+    return;
+}
+
+fn append_little_endian(allocator: Allocator, out: &var string::String, value: u64, width: i64) -> mem::Error!void {
+    for 0..width |index| {
+        try out.append_byte(allocator, cast<u8>((value >> cast<u64>(8 * index)) & 0xff));
+    }
+    return;
+}
+
+fn number_at(list: &json::Value, index: i64) -> f64 {
+    match list {
+        Arr(items) => {
+            if items.at(index) |item| {
+                match item {
+                    F64(value) => return value,
+                    I64(value) => return cast<f64>(value),
+                    _ => return 0.0,
+                }
+            }
+        },
+        _ => {},
+    }
+    testing::fail("expected a number in the fixture list");
+    return 0.0;
+}
+
+fn number_member(object: &json::Value, key: []u8) -> f64 {
+    if member(object, key) |found| {
+        match found {
+            F64(value) => return value,
+            I64(value) => return cast<f64>(value),
+            _ => {},
+        }
+    }
+    testing::fail("expected a number member in the fixture");
+    return 0.0;
+}
+
+test "tiny container header numbers match the fixture" {
+    let allocator = mem::page_allocator();
+    let fixture = try load_fixture(allocator);
+    defer fixture.deinit(allocator);
+    let file = fixture.file.as_bytes();
+    let header = try read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    if member(&fixture.expected, "header") |numbers| {
+        testing::expect_equal<f64>(number_at(numbers, 0), cast<f64>(header.version));
+        testing::expect_equal<f64>(number_at(numbers, 1), cast<f64>(header.header_byte_count));
+        testing::expect_equal<f64>(number_at(numbers, 2), cast<f64>(header.data_offset));
+        testing::expect_equal<f64>(number_at(numbers, 3), cast<f64>(header.file_byte_count));
+    } else {
+        testing::fail("fixture has no header list");
+    }
+}
+
+fn sign_rule_named(case: &json::Value) -> !SignRule {
+    match case {
+        Arr(items) => {
+            if items.at(0) |name| {
+                match name {
+                    Str(text) => {
+                        let bytes = text.as_bytes();
+                        if mem::equal_bytes(bytes, "splitmix64") {
+                            return SignRule::SplitMix64;
+                        }
+                        return SignRule::Mulberry32;
+                    },
+                    _ => {},
+                }
+            }
+        },
+        _ => {},
+    }
+    return ContainerError::InvalidHeader;
+}
+
+fn expect_sign_case_digest(allocator: Allocator, case: &json::Value) -> !void {
+    let rule = try sign_rule_named(case);
+    let seed = cast<u64>(number_at(case, 1));
+    let first_position = cast<u64>(number_at(case, 2));
+    let count = cast<i64>(number_at(case, 3));
+    var sign_bytes = string::new(allocator);
+    defer sign_bytes.deinit(allocator);
+    for 0..count |index| {
+        let sign = stream_sign(rule, seed, first_position + cast<u64>(index));
+        try sign_bytes.append_byte(allocator, cast<u8>(cast<i64>(sign) & 0xff));
+    }
+    var hex = string::new(allocator);
+    defer hex.deinit(allocator);
+    let sign_view = sign_bytes.as_bytes();
+    try append_lowercase_hex_sha256(allocator, &var hex, sign_view);
+    match case {
+        Arr(items) => {
+            if items.at(4) |digest| {
+                match digest {
+                    Str(text) => {
+                        let expected_hex = text.as_bytes();
+                        let actual_hex = hex.as_bytes();
+                        testing::expect(mem::equal_bytes(expected_hex, actual_hex));
+                    },
+                    _ => testing::fail("sign digest is not text"),
+                }
+            }
+        },
+        _ => {},
+    }
+    return;
+}
+
+test "sign streams match the fixture digests" {
+    let allocator = mem::page_allocator();
+    let fixture = try load_fixture(allocator);
+    defer fixture.deinit(allocator);
+    let file = fixture.file.as_bytes();
+    let header = try read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    if member(&fixture.expected, "signs") |cases| {
+        match cases {
+            Arr(items) => {
+                testing::expect_equal<i64>(5, items.len());
+                var index: i64 = 0;
+                while items.at(index) |case| {
+                    try expect_sign_case_digest(allocator, case);
+                    index = index + 1;
+                }
+            },
+            _ => testing::fail("signs is not a list"),
+        }
+    }
+}
+
+fn check_tensor(allocator: Allocator, file: []u8, tensor: &TensorRecord, expected: &json::Value) -> !void {
+    var state_bytes = string::new(allocator);
+    defer state_bytes.deinit(allocator);
+    var rotated_bytes = string::new(allocator);
+    defer rotated_bytes.deinit(allocator);
+    var values = array::new<f32>(allocator);
+    defer values.deinit(allocator);
+    for 0..(tensor.rows * tensor.cols) |index| {
+        try values.append(allocator, cast<f32>(0.0));
+    }
+    let value_view = values.as_mut_slice();
+    for 0..tensor.rows |row| {
+        for 0..sequences_per_row(tensor) |sequence| {
+            for 0..steps_per_sequence() |step| {
+                try append_little_endian(allocator, &var state_bytes, cast<u64>(step_state(file, tensor, row, sequence, step)), 2);
+            }
+        }
+        var row_values = array::new<f32>(allocator);
+        defer row_values.deinit(allocator);
+        for 0..tensor.cols |col| {
+            try row_values.append(allocator, cast<f32>(0.0));
+        }
+        let row_view = row_values.as_mut_slice();
+        fill_rotated_row(file, tensor, row, &var row_view);
+        for 0..tensor.cols |col| {
+            value_view[row * tensor.cols + col] = row_view[col];
+            try append_little_endian(allocator, &var rotated_bytes, cast<u64>(binary32_bits(row_view[col])), 4);
+        }
+    }
+    let state_view = state_bytes.as_bytes();
+    try expect_member_is_sha256_of(allocator, expected, "states_sha256", state_view);
+    let rotated_view = rotated_bytes.as_bytes();
+    try expect_member_is_sha256_of(allocator, expected, "rotated_sha256", rotated_view);
+
+    restore_original_coordinates(tensor, &var value_view);
+    if member(expected, "sample_at") |positions| {
+        if member(expected, "sample_values") |samples| {
+            for 0..12 |sample| {
+                match positions {
+                    Arr(items) => {
+                        if items.at(sample) |position| {
+                            let row = cast<i64>(number_at(position, 0));
+                            let col = cast<i64>(number_at(position, 1));
+                            let expected_value = cast<f32>(number_at(samples, sample));
+                            var difference = value_view[row * tensor.cols + col] - expected_value;
+                            if difference < cast<f32>(0.0) {
+                                difference = -difference;
+                            }
+                            testing::expect(difference < cast<f32>(0.0000001));
+                        }
+                    },
+                    _ => testing::fail("sample_at is not a list"),
+                }
+            }
+        }
+    }
+    var square_norm: f64 = 0.0;
+    for 0..(tensor.rows * tensor.cols) |index| {
+        let value = cast<f64>(value_view[index]);
+        square_norm = square_norm + value * value;
+    }
+    let expected_norm = number_member(expected, "frobenius");
+    var norm_difference = square_norm - expected_norm * expected_norm;
+    if norm_difference < 0.0 {
+        norm_difference = -norm_difference;
+    }
+    testing::expect(norm_difference < 0.0000002 * square_norm);
+    return;
+}
+
+fn check_named_tensor(allocator: Allocator, file: []u8, header: &ContainerHeader, expected_tensors: &json::Value, name: []u8) -> !void {
+    let index = find_tensor(header, name) orelse return ContainerError::MissingMember;
+    if header.tensors.at(index) |tensor| {
+        if member(expected_tensors, name) |expected| {
+            try check_tensor(allocator, file, tensor, expected);
+            return;
+        }
+    }
+    return ContainerError::MissingMember;
+}
+
+test "every tensor matches the fixture in rotated and original coordinates" {
+    let allocator = mem::page_allocator();
+    let fixture = try load_fixture(allocator);
+    defer fixture.deinit(allocator);
+    let file = fixture.file.as_bytes();
+    let header = try read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    if member(&fixture.expected, "tensors") |expected_tensors| {
+        try check_named_tensor(allocator, file, &header, expected_tensors, "tiny.body6");
+        try check_named_tensor(allocator, file, &header, expected_tensors, "tiny.body8");
+        try check_named_tensor(allocator, file, &header, expected_tensors, "tiny.head");
+        try check_named_tensor(allocator, file, &header, expected_tensors, "tiny.embed");
+    } else {
+        testing::fail("fixture has no tensors");
+    }
+}
+
+fn check_named_vector(allocator: Allocator, file: []u8, header: &ContainerHeader, expected_vectors: &json::Value, name: []u8) -> !void {
+    let index = find_vector(header, name) orelse return ContainerError::MissingMember;
+    if header.vectors.at(index) |vector| {
+        if member(expected_vectors, name) |expected| {
+            var value_bytes = string::new(allocator);
+            defer value_bytes.deinit(allocator);
+            for 0..vector.count |element| {
+                try append_little_endian(allocator, &var value_bytes, cast<u64>(binary32_bits(vector_value(file, vector, element))), 4);
+            }
+            let value_view = value_bytes.as_bytes();
+            try expect_member_is_sha256_of(allocator, expected, "sha256", value_view);
+            return;
+        }
+    }
+    return ContainerError::MissingMember;
+}
+
+test "every vector matches the fixture digest" {
+    let allocator = mem::page_allocator();
+    let fixture = try load_fixture(allocator);
+    defer fixture.deinit(allocator);
+    let file = fixture.file.as_bytes();
+    let header = try read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    if member(&fixture.expected, "vectors") |expected_vectors| {
+        try check_named_vector(allocator, file, &header, expected_vectors, "tiny.norm");
+        try check_named_vector(allocator, file, &header, expected_vectors, "tiny.half");
+    } else {
+        testing::fail("fixture has no vectors");
+    }
+}

@@ -1,0 +1,278 @@
+import std::float;
+import std::gpu;
+
+fn delta_head_width() -> i64 {
+    return 128;
+}
+
+fn delta_channels() -> i64 {
+    return 10240;
+}
+
+fn delta_key_width() -> i64 {
+    return 2048;
+}
+
+fn delta_value_heads() -> i64 {
+    return 48;
+}
+
+fn hidden_width() -> i64 {
+    return 5120;
+}
+
+fn delta_query_stride() -> i64 {
+    return delta_key_width();
+}
+
+fn delta_gate_stride() -> i64 {
+    return 2 * delta_value_heads();
+}
+
+fn delta_core_stride() -> i64 {
+    return delta_value_heads() * delta_head_width();
+}
+
+fn delta_state_floats() -> i64 {
+    return delta_value_heads() * delta_head_width() * delta_head_width();
+}
+
+export "gpu" fn delta_convolution(
+    projected: []f32,
+    convolution: []f32,
+    history: &var []f32,
+    convolved: &var []f32,
+    base_slot: i64,
+    token_count: i64
+) -> void {
+    let channel = gpu::thread_index();
+    let channels = delta_channels();
+    if channel >= channels {
+        return;
+    }
+    let slot_floats = 3 * channels;
+    let from = base_slot * slot_floats;
+    var oldest = history[from + channel];
+    var middle = history[from + channels + channel];
+    var newest = history[from + 2 * channels + channel];
+    for 0..token_count |token| {
+        let current = round_to_bf16(projected[token * slot_values() + channel]);
+        var value = convolution[channel * 4] * oldest;
+        value = value + convolution[channel * 4 + 1] * middle;
+        value = value + convolution[channel * 4 + 2] * newest;
+        value = value + convolution[channel * 4 + 3] * current;
+        convolved[token * channels + channel] = round_to_bf16(silu_of(round_to_bf16(value)));
+        oldest = middle;
+        middle = newest;
+        newest = current;
+        let to = ((base_slot + token + 1) % state_slots()) * slot_floats;
+        history[to + channel] = oldest;
+        history[to + channels + channel] = middle;
+        history[to + 2 * channels + channel] = newest;
+    }
+    return;
+}
+
+export "gpu" fn delta_query_key(convolved_all: []f32, queries: &var []f32, keys: &var []f32) -> void {
+    var length_storage = gpu::group_array<[2]f32>();
+    let inverse_lengths = length_storage.as_mut_slice();
+    let token = gpu::group_index() / (delta_key_width() / delta_head_width());
+    let head = gpu::group_index() % (delta_key_width() / delta_head_width());
+    let channel = gpu::local_index();
+    let width = delta_head_width();
+    let convolved_first = token * delta_channels();
+    let convolved = convolved_all[convolved_first..convolved_first + delta_channels()];
+    let first = head * width;
+    let out_first = token * delta_query_stride() + first;
+    if channel < 2 {
+        let values_first = channel * delta_key_width() + first;
+        var total: f32 = 0.0;
+        for 0..width |index| {
+            total = total + convolved[values_first + index] * convolved[values_first + index];
+        }
+        inverse_lengths[channel] = one() / gpu::sqrt(total + model_epsilon());
+    }
+    gpu::barrier();
+    queries[out_first + channel] = (convolved[first + channel] * inverse_lengths[0]) * float::from_bits_f32(0x3db504f3);
+    keys[out_first + channel] = convolved[delta_key_width() + first + channel] * inverse_lengths[1];
+    return;
+}
+
+fn row_dot(rows: []f32, first: i64, weighted_bf16: []f32) -> f32 {
+    var dot: f32 = 0.0;
+    for 0..hidden_width() |index| {
+        dot = dot + rows[first + index] * weighted_bf16[index];
+    }
+    return dot;
+}
+
+export "gpu" fn delta_gates(
+    decay_rows: []f32,
+    update_rows: []f32,
+    weighted_bf16: []f32,
+    scalars: []f32,
+    log_decay: []f32,
+    time_bias: []f32,
+    gates: &var []f32
+) -> void {
+    let heads = delta_value_heads();
+    let token = gpu::thread_index() / (2 * heads);
+    let id = gpu::thread_index() % (2 * heads);
+    if token >= batch_capacity() {
+        return;
+    }
+    let weighted_first = token * hidden_stride();
+    let weighted_token = weighted_bf16[weighted_first..weighted_first + hidden_stride()];
+    let head = id % heads;
+    let first = head * hidden_width();
+    let is_update = id < heads;
+    var rows = decay_rows;
+    if is_update {
+        rows = update_rows;
+    }
+    let gate = round_to_bf16(row_dot(rows, first, weighted_token) * scalars[token * scalar_stride()]);
+    let gate_first = token * delta_gate_stride();
+    if is_update {
+        gates[gate_first + head] = round_to_bf16(sigmoid_of(gate));
+    } else {
+        gates[gate_first + heads + head] = gpu::exp(-gpu::exp(log_decay[head]) * softplus_of(gate + time_bias[head]));
+    }
+    return;
+}
+
+fn recurrence_log_token_floats() -> i64 {
+    return 8256;
+}
+
+fn recurrence_log_corrections() -> i64 {
+    return 2048;
+}
+
+fn recurrence_log_decays() -> i64 {
+    return 8192;
+}
+
+export "gpu" fn delta_recurrence(
+    convolved: []f32,
+    queries: []f32,
+    keys: []f32,
+    gates: []f32,
+    states: &var []f32,
+    log: &var []f32,
+    core: &var []f32,
+    pending: i64,
+    read_half: i64,
+    token_count: i64
+) -> void {
+    let value_head = gpu::group_index();
+    let local = gpu::local_index();
+    let value_channel = local >> 2;
+    let quarter = local & 3;
+    let width = delta_head_width();
+    let first_key = quarter * 32;
+    let state_first = value_head * width * width + first_key * width + value_channel;
+    let half_floats = batch_capacity() * recurrence_log_token_floats();
+    let read_first = read_half * half_floats;
+    let write_first = (1 - read_half) * half_floats;
+    let key_offset = (value_head / 3) * width;
+    let own = value_head * width + value_channel;
+    var column = [32]f32{};
+    for 0..32 |offset| {
+        column[offset] = states[state_first + offset * width];
+    }
+    for 0..pending |token| {
+        let entry = read_first + token * recurrence_log_token_floats();
+        let decay = log[entry + recurrence_log_decays() + value_head];
+        let correction = log[entry + recurrence_log_corrections() + own];
+        let logged_keys = log[entry + key_offset + first_key..entry + key_offset + first_key + 32];
+        for 0..32 |offset| {
+            let decayed = column[offset] * decay;
+            column[offset] = decayed + logged_keys[offset] * correction;
+        }
+    }
+    if pending > 0 {
+        for 0..32 |offset| {
+            states[state_first + offset * width] = column[offset];
+        }
+    }
+    for 0..token_count |token| {
+        let entry = write_first + token * recurrence_log_token_floats();
+        let key_first = token * delta_query_stride() + key_offset;
+        let token_keys = keys[key_first + first_key..key_first + first_key + 32];
+        let token_queries = queries[key_first + first_key..key_first + first_key + 32];
+        let update = gates[token * delta_gate_stride() + value_head];
+        let decay = gates[token * delta_gate_stride() + delta_value_heads() + value_head];
+        var sum: f32 = 0.0;
+        for 0..32 |offset| {
+            let decayed = column[offset] * decay;
+            column[offset] = decayed;
+            sum = sum + decayed * token_keys[offset];
+        }
+        let prediction = quarter_total(sum, quarter);
+        let correction = (convolved[token * delta_channels() + 2 * delta_key_width() + own] - prediction) * update;
+        var output: f32 = 0.0;
+        for 0..32 |offset| {
+            let updated = column[offset] + token_keys[offset] * correction;
+            column[offset] = updated;
+            output = output + updated * token_queries[offset];
+        }
+        let total = quarter_total(output, quarter);
+        if quarter == 0 {
+            core[token * delta_core_stride() + own] = round_to_bf16(total);
+            log[entry + recurrence_log_corrections() + own] = correction;
+        }
+        if local == 0 {
+            log[entry + recurrence_log_decays() + value_head] = decay;
+        }
+        if value_head % 3 == 0 and local < 128 {
+            log[entry + key_offset + local] = keys[key_first + local];
+        }
+    }
+    return;
+}
+
+fn quarter_total(partial: f32, quarter: i64) -> f32 {
+    let one = gpu::shuffle_xor(partial, 1);
+    let two = gpu::shuffle_xor(partial, 2);
+    let three = gpu::shuffle_xor(partial, 3);
+    let first = quarter_pick(quarter, partial, one, two, three);
+    let second = quarter_pick(quarter ^ 1, partial, one, two, three);
+    let third = quarter_pick(quarter ^ 2, partial, one, two, three);
+    let fourth = quarter_pick(quarter ^ 3, partial, one, two, three);
+    return ((first + second) + third) + fourth;
+}
+
+fn quarter_pick(distance: i64, own: f32, one: f32, two: f32, three: f32) -> f32 {
+    if distance == 0 {
+        return own;
+    }
+    if distance == 1 {
+        return one;
+    }
+    if distance == 2 {
+        return two;
+    }
+    return three;
+}
+
+export "gpu" fn delta_output(core: []f32, output_norm: []f32, projected_gates: []f32, gated: &var []f32) -> void {
+    var rms_storage = gpu::group_array<[1]f32>();
+    let shared_inverse_rms = rms_storage.as_mut_slice();
+    let token = gpu::group_index() / delta_value_heads();
+    let value_head = gpu::group_index() % delta_value_heads();
+    let channel = gpu::local_index();
+    let width = delta_head_width();
+    let head_first = token * delta_core_stride() + value_head * width;
+    if channel == 0 {
+        var total: f32 = 0.0;
+        for 0..width |index| {
+            total = total + core[head_first + index] * core[head_first + index];
+        }
+        shared_inverse_rms[0] = one() / gpu::sqrt(total / cast<f32>(width) + model_epsilon());
+    }
+    gpu::barrier();
+    let index = value_head * width + channel;
+    let normalized = round_to_bf16(output_norm[channel] * round_to_bf16(core[head_first + channel] * shared_inverse_rms[0]));
+    gated[token * activation_stride() + index] = round_to_bf16(normalized * silu_of(round_to_bf16(projected_gates[token * slot_values() + index])));
+    return;
+}

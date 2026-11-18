@@ -1,0 +1,10 @@
+[package]
+name = "mackani-bench-driver"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+mackani = { git = "https://github.com/TKY-27/Mackani", rev = "25f0779e6ac2307f906b268d729f38fc7984d4bc" }
+mackani-engine = { git = "https://github.com/TKY-27/Mackani", rev = "25f0779e6ac2307f906b268d729f38fc7984d4bc" }
+
+[workspace]

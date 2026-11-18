@@ -1,0 +1,192 @@
+import kizukani::vulkan;
+import std::fs;
+import std::io;
+import std::mem;
+import std::string;
+
+pub struct VulkanDecoder {
+    gpu: vulkan::Gpu,
+    six_bit_sums: vulkan::Kernel,
+    eight_bit_sums: vulkan::Kernel,
+    six_bit_batch_sums: vulkan::Kernel,
+    eight_bit_batch_sums: vulkan::Kernel,
+    prepare: vulkan::Kernel,
+    finish_activation: vulkan::Kernel,
+    restore: vulkan::Kernel,
+    attention_keys: vulkan::Kernel,
+    attention_queries: vulkan::Kernel,
+    attention_scores: vulkan::Kernel,
+    attention_weights: vulkan::Kernel,
+    attention_output: vulkan::Kernel,
+    delta_convolution: vulkan::Kernel,
+    delta_query_key: vulkan::Kernel,
+    delta_gates: vulkan::Kernel,
+    delta_recurrence: vulkan::Kernel,
+    delta_output: vulkan::Kernel,
+    gated_product: vulkan::Kernel,
+    add_residual: vulkan::Kernel,
+    copy_rows: vulkan::Kernel,
+    file_bytes: vulkan::Buffer,
+    constants: vulkan::Buffer,
+    workspace: vulkan::Buffer,
+    status: vulkan::Buffer,
+    readback: vulkan::Buffer,
+    file_byte_count: u64,
+    constant_byte_count: u64,
+    layout: WorkspaceLayout,
+    records: DecoderRecords,
+}
+
+pub fn generated_spirv_path() -> []u8 {
+    return "target/kernels.spv";
+}
+
+/// file_address is the start of a mapping of file_byte_count readable bytes that stays alive during the call.
+pub unsafe fn open_vulkan_decoder(allocator: Allocator, weights: &ModelWeights, file_address: u64, file_byte_count: u64) -> !VulkanDecoder {
+    var builder = ConstantsBuilder { bytes: string::new(allocator) };
+    defer builder.deinit(allocator);
+    var records = try build_constants(allocator, &var builder, weights, file_address);
+    errdefer records.deinit(allocator);
+    let path = generated_spirv_path();
+    let code = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer code.deinit(allocator);
+
+    let gpu = try vulkan::open_default_gpu();
+    errdefer gpu.deinit();
+    let code_bytes = code.as_bytes();
+    let library = try gpu.load_library(code_bytes);
+    let sums_width = cast<u64>(32 * linear_sums_simdgroups_per_row_group());
+    let six_bit_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_six", sums_width, 7);
+    let eight_bit_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_eight", sums_width, 7);
+    let six_bit_batch_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_six_batch", sums_width, 9);
+    let eight_bit_batch_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_eight_batch", sums_width, 9);
+    let prepare = try library.kernel(&gpu, c"prepare_activation", 512, 11);
+    let finish_activation = try library.kernel(&gpu, c"finish_activation", 32, 6);
+    let restore = try library.kernel(&gpu, c"restore_rows", 512, 9);
+    let head_width = cast<u64>(attention_head_width());
+    let attention_keys = try library.kernel(&gpu, c"attention_keys", head_width, 8);
+    let attention_queries = try library.kernel(&gpu, c"attention_queries", head_width, 4);
+    let attention_scores = try library.kernel(&gpu, c"attention_scores", 256, 7);
+    let attention_weights = try library.kernel(&gpu, c"attention_weights", 32, 5);
+    let attention_output = try library.kernel(&gpu, c"attention_output", head_width, 8);
+    let delta_width = cast<u64>(delta_net_head_width());
+    let delta_convolution = try library.kernel(&gpu, c"delta_convolution", 256, 6);
+    let delta_query_key = try library.kernel(&gpu, c"delta_query_key", delta_width, 3);
+    let delta_gates = try library.kernel(&gpu, c"delta_gates", cast<u64>(2 * delta_net_value_heads()), 7);
+    let delta_recurrence = try library.kernel(&gpu, c"delta_recurrence", 4 * delta_width, 10);
+    let delta_output = try library.kernel(&gpu, c"delta_output", delta_width, 4);
+    let gated_product = try library.kernel(&gpu, c"gated_product", 256, 4);
+    let add_residual = try library.kernel(&gpu, c"add_residual", 256, 3);
+    let copy_rows = try library.kernel(&gpu, c"copy_rows", 256, 6);
+    library.release(&gpu);
+
+    let file_bytes = try gpu.new_device_buffer(file_byte_count);
+    // SAFETY: the caller keeps file_byte_count bytes at file_address readable during the call.
+    try gpu.upload(&file_bytes, unsafe ptr_from_int<ptr<const u8>>(cast<usize>(file_address)), file_byte_count);
+    let constant_bytes = builder.bytes.as_bytes();
+    let constant_byte_count = cast<u64>(mem::len(constant_bytes));
+    let constants = try gpu.new_shared_buffer(constant_byte_count);
+    copy_into_buffer<vulkan::Buffer>(&constants, constant_bytes);
+    let layout = workspace_layout(weights.attention_layers.len(), weights.delta_net_layers.len(), decode_maximum_positions());
+    let workspace = try gpu.new_shared_buffer(layout.total);
+    zero_workspace_range<vulkan::Buffer>(&workspace, layout.recurrent, cast<i64>(layout.key_cache - layout.recurrent));
+    let status = try gpu.new_shared_buffer(16);
+    zero_workspace_range<vulkan::Buffer>(&status, 0, 16);
+    let readback = try gpu.new_readback_buffer(cast<u64>(weights.vocabulary_size) * 4);
+    return VulkanDecoder {
+        gpu: move gpu,
+        six_bit_sums: six_bit_sums,
+        eight_bit_sums: eight_bit_sums,
+        six_bit_batch_sums: six_bit_batch_sums,
+        eight_bit_batch_sums: eight_bit_batch_sums,
+        prepare: prepare,
+        finish_activation: finish_activation,
+        restore: restore,
+        attention_keys: attention_keys,
+        attention_queries: attention_queries,
+        attention_scores: attention_scores,
+        attention_weights: attention_weights,
+        attention_output: attention_output,
+        delta_convolution: delta_convolution,
+        delta_query_key: delta_query_key,
+        delta_gates: delta_gates,
+        delta_recurrence: delta_recurrence,
+        delta_output: delta_output,
+        gated_product: gated_product,
+        add_residual: add_residual,
+        copy_rows: copy_rows,
+        file_bytes: file_bytes,
+        constants: constants,
+        workspace: workspace,
+        status: status,
+        readback: readback,
+        file_byte_count: file_byte_count,
+        constant_byte_count: constant_byte_count,
+        layout: layout,
+        records: move records,
+    };
+}
+
+pub fn (self: VulkanDecoder) deinit(allocator: Allocator) -> void {
+    self.readback.release(&self.gpu);
+    self.status.release(&self.gpu);
+    self.workspace.release(&self.gpu);
+    self.constants.release(&self.gpu);
+    self.file_bytes.release(&self.gpu);
+    self.copy_rows.release(&self.gpu);
+    self.add_residual.release(&self.gpu);
+    self.gated_product.release(&self.gpu);
+    self.delta_output.release(&self.gpu);
+    self.delta_recurrence.release(&self.gpu);
+    self.delta_gates.release(&self.gpu);
+    self.delta_query_key.release(&self.gpu);
+    self.delta_convolution.release(&self.gpu);
+    self.attention_output.release(&self.gpu);
+    self.attention_weights.release(&self.gpu);
+    self.attention_scores.release(&self.gpu);
+    self.attention_keys.release(&self.gpu);
+    self.attention_queries.release(&self.gpu);
+    self.restore.release(&self.gpu);
+    self.finish_activation.release(&self.gpu);
+    self.prepare.release(&self.gpu);
+    self.eight_bit_batch_sums.release(&self.gpu);
+    self.six_bit_batch_sums.release(&self.gpu);
+    self.eight_bit_sums.release(&self.gpu);
+    self.six_bit_sums.release(&self.gpu);
+    self.gpu.deinit();
+    self.records.deinit(allocator);
+    return;
+}
+
+pub fn (self: &VulkanDecoder) print_profile() -> void {
+    self.gpu.print_profile(&self.six_bit_sums, "six_bit_sums");
+    self.gpu.print_profile(&self.eight_bit_sums, "eight_bit_sums");
+    self.gpu.print_profile(&self.prepare, "prepare");
+    self.gpu.print_profile(&self.finish_activation, "finish_activation");
+    self.gpu.print_profile(&self.restore, "restore");
+    self.gpu.print_profile(&self.attention_keys, "attention_keys");
+    self.gpu.print_profile(&self.attention_queries, "attention_queries");
+    self.gpu.print_profile(&self.attention_scores, "attention_scores");
+    self.gpu.print_profile(&self.attention_weights, "attention_weights");
+    self.gpu.print_profile(&self.attention_output, "attention_output");
+    self.gpu.print_profile(&self.delta_convolution, "delta_convolution");
+    self.gpu.print_profile(&self.delta_query_key, "delta_query_key");
+    self.gpu.print_profile(&self.delta_gates, "delta_gates");
+    self.gpu.print_profile(&self.delta_recurrence, "delta_recurrence");
+    self.gpu.print_profile(&self.delta_output, "delta_output");
+    self.gpu.print_profile(&self.gated_product, "gated_product");
+    self.gpu.print_profile(&self.add_residual, "add_residual");
+    return;
+}
+
+pub fn (self: &VulkanDecoder) decode_token(weights: &ModelWeights, embedding: []f32, position: i64) -> !i64 {
+    try run_token<VulkanDecoder, vulkan::ComputePass>(self, weights, embedding, position);
+    let pass = try self.gpu.begin_compute_pass();
+    pass.copy_buffer(&self.workspace, projected_slot<VulkanDecoder>(self, 0), &self.readback, 0, cast<u64>(weights.vocabulary_size) * 4);
+    try pass.finish();
+    // SAFETY: the copy finished, and the readback buffer holds vocabulary_size logits.
+    let logit_cells = unsafe ptr_from_int<ptr<const f32>>(cast<usize>(int_from_ptr<usize>(self.readback.contents())));
+    // SAFETY: as above.
+    let logits = unsafe view_from_ptr(logit_cells, weights.vocabulary_size);
+    return greedy_token(logits);
+}

@@ -1,0 +1,118 @@
+import kizukani::metal;
+import std::fs;
+import std::io;
+import std::mem;
+import std::rand;
+
+fn bind_values(pass: &metal::ComputePass, index: u64, values: []i64) -> void {
+    // SAFETY: the values are 8 * count readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(values));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, mem::count<i64>(values) * 8);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn fill_random(buffer: &metal::Buffer, byte_count: i64, seed: i64) -> void {
+    // SAFETY: the buffer holds byte_count bytes, and no GPU work uses it yet.
+    let cells = unsafe mut_view_from_ptr(buffer.contents(), byte_count);
+    var random = rand::new(seed);
+    for 0..byte_count |index| {
+        cells[index] = cast<u8>(random.below(256));
+    }
+    return;
+}
+
+fn fill_small_weights(buffer: &metal::Buffer, count: i64) -> void {
+    // SAFETY: the buffer holds count i64, and no GPU work uses it yet.
+    let cells = unsafe mut_view_from_ptr(unsafe cast<ptr<i64>>(buffer.contents()), count);
+    for 0..count |index| {
+        cells[index] = 1 + index % 7;
+    }
+    return;
+}
+
+pub fn run_gpu_batch_benchmark(kernel_path: []u8, batch: i64) -> !void {
+    let allocator = mem::page_allocator();
+    let source = try fs::read_file(io::blocking(), allocator, &kernel_path, mem::Limit::Unlimited);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let single = try library.kernel(&gpu, c"compressed_linear_row_sums_six");
+    defer single.release();
+    let batched = try library.kernel(&gpu, c"compressed_linear_row_sums_six_batch");
+    defer batched.release();
+    let physical_rows: i64 = 17408;
+    let sequences: i64 = 20;
+    let code_count = sequences * (physical_rows / 32) * 768;
+    let codes = try gpu.new_shared_buffer(cast<u64>(code_count * 4));
+    defer codes.release();
+    let table = try gpu.new_shared_buffer(8192);
+    defer table.release();
+    let activation = try gpu.new_shared_buffer(cast<u64>(sequences * 2048 * 4));
+    defer activation.release();
+    let block_weights = try gpu.new_shared_buffer(cast<u64>(sequences * 64));
+    defer block_weights.release();
+    let sums = try gpu.new_shared_buffer(cast<u64>(physical_rows * 64));
+    defer sums.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    fill_random(&codes, code_count * 4, 1);
+    fill_random(&table, 8192, 2);
+    fill_random(&activation, sequences * 2048, 3);
+    fill_small_weights(&block_weights, sequences * 8);
+    var best_single: f64 = 1.0e9;
+    var best_batched: f64 = 1.0e9;
+    for 0..200 |round| {
+        let first_pass = try gpu.begin_compute_pass();
+        first_pass.bind_buffer(0, &codes);
+        first_pass.bind_buffer(1, &table);
+        first_pass.bind_buffer(2, &activation);
+        first_pass.bind_buffer(3, &block_weights);
+        first_pass.bind_buffer(4, &sums);
+        let single_shape = [2]i64{ physical_rows, sequences };
+        let single_view = single_shape.as_slice();
+        bind_values(&first_pass, 5, single_view[0..1]);
+        bind_values(&first_pass, 6, single_view[1..2]);
+        let single_lengths = [5]i64{ code_count, 4096, sequences * 256, sequences / 2, physical_rows };
+        let single_length_view = single_lengths.as_slice();
+        bind_values(&first_pass, 7, single_length_view);
+        first_pass.bind_buffer(8, &status);
+        first_pass.dispatch_threadgroups(&single, cast<u64>(physical_rows / 32), 128);
+        let single_seconds = try first_pass.finish_and_measure_gpu_seconds();
+        let second_pass = try gpu.begin_compute_pass();
+        second_pass.bind_buffer(0, &codes);
+        second_pass.bind_buffer(1, &table);
+        second_pass.bind_buffer(2, &activation);
+        second_pass.bind_buffer(3, &block_weights);
+        second_pass.bind_buffer(4, &sums);
+        let batch_shape = [4]i64{ physical_rows, sequences, batch, physical_rows };
+        let batch_view = batch_shape.as_slice();
+        bind_values(&second_pass, 5, batch_view[0..1]);
+        bind_values(&second_pass, 6, batch_view[1..2]);
+        bind_values(&second_pass, 7, batch_view[2..3]);
+        bind_values(&second_pass, 8, batch_view[3..4]);
+        let batch_lengths = [5]i64{ code_count, 4096, sequences * 1024, sequences * 8, physical_rows * 8 };
+        let batch_length_view = batch_lengths.as_slice();
+        bind_values(&second_pass, 9, batch_length_view);
+        second_pass.bind_buffer(10, &status);
+        second_pass.dispatch_threadgroups(&batched, cast<u64>(physical_rows / 32), 128);
+        let batched_seconds = try second_pass.finish_and_measure_gpu_seconds();
+        if single_seconds < best_single {
+            best_single = single_seconds;
+        }
+        if batched_seconds < best_batched {
+            best_batched = batched_seconds;
+        }
+    }
+    // SAFETY: every pass finished, and the status buffer holds one u32.
+    let status_view = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(status.contents()), 1);
+    print("status, single microseconds, batched microseconds:");
+    print(status_view[0]);
+    print(cast<i64>(best_single * 1000000.0));
+    print(cast<i64>(best_batched * 1000000.0));
+    return;
+}

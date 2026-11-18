@@ -1,0 +1,79 @@
+import kizukani::yskn;
+import std::float;
+import std::math;
+import std::rand;
+import std::testing;
+
+test "bf16 rounding keeps values that already fit" {
+    testing::expect(round_to_bf16(1.5) == 1.5);
+}
+
+test "bf16 rounding breaks ties to even" {
+    let tie = yskn::binary32_from_bits(0x3f808000);
+    testing::expect_equal<u32>(0x3f800000, yskn::binary32_bits(round_to_bf16(tie)));
+    let odd_tie = yskn::binary32_from_bits(0x3f818000);
+    testing::expect_equal<u32>(0x3f820000, yskn::binary32_bits(round_to_bf16(odd_tie)));
+}
+
+test "f16 rounding keeps eleven significant bits" {
+    testing::expect(round_to_f16(1.0) == 1.0);
+    testing::expect(round_to_f16(cast<f32>(1.0 + 1.0 / 2048.0)) == 1.0);
+    testing::expect(round_to_f16(cast<f32>(1.0 + 3.0 / 2048.0)) == cast<f32>(1.0 + 4.0 / 2048.0));
+}
+
+test "f16 rounding keeps the subnormal grid" {
+    let smallest = cast<f32>(0.000000059604644775390625);
+    testing::expect(round_to_f16(smallest) == smallest);
+    testing::expect(round_to_f16(smallest * cast<f32>(0.25)) == 0.0);
+}
+
+test "f16 rounding overflows past the largest finite half" {
+    testing::expect(round_to_f16(65504.0) == 65504.0);
+    testing::expect(round_to_f16(70000.0) > 65504.0);
+}
+
+test "reference-order sum of squares equals the plain sum for small integers" {
+    var values = [512]f32{};
+    let view = values.as_mut_slice();
+    for 0..512 |index| {
+        view[index] = cast<f32>(index % 3);
+    }
+    testing::expect(sum_of_squares_in_reference_order(view) == cast<f32>(170 * 5 + 1));
+}
+
+fn round_to_f16_through_binary64(value: f32) -> f32 {
+    let wide = cast<f64>(value);
+    let magnitude = math::abs<f64>(wide);
+    if magnitude == 0.0 or float::is_nan(wide) {
+        return value;
+    }
+    var exponent = cast<i64>(math::floor<f64>(math::log2<f64>(magnitude)));
+    if math::ldexp<f64>(1.0, exponent) > magnitude {
+        exponent = exponent - 1;
+    }
+    if math::ldexp<f64>(1.0, exponent + 1) <= magnitude {
+        exponent = exponent + 1;
+    }
+    if exponent < -14 {
+        exponent = -14;
+    }
+    let unit = math::ldexp<f64>(1.0, exponent - 10);
+    let rounded = math::round_even<f64>(wide / unit) * unit;
+    if math::abs<f64>(rounded) > 65504.0 {
+        if rounded < 0.0 {
+            return cast<f32>(-math::infinity<f64>());
+        }
+        return cast<f32>(math::infinity<f64>());
+    }
+    return cast<f32>(rounded);
+}
+
+test "bit-level f16 rounding agrees with binary64 rounding across magnitudes" {
+    var random = rand::new(41);
+    for 0..200000 |trial| {
+        let bits = cast<u32>(random.next() & 0xffffffff);
+        let exponent_window = cast<u32>(random.below(60) + 88) << 23;
+        let value = yskn::binary32_from_bits((bits & 0x807fffff) | exponent_window);
+        testing::expect_equal<u32>(yskn::binary32_bits(round_to_f16_through_binary64(value)), yskn::binary32_bits(round_to_f16(value)));
+    }
+}

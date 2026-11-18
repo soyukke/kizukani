@@ -1,0 +1,14 @@
+import std::gpu;
+
+export "gpu" fn gated_product(gate: []f32, up: []f32, product: &var []f32, width: i64) -> void {
+    let id = gpu::thread_index();
+    let token = id / width;
+    let index = id % width;
+    if token >= batch_capacity() {
+        return;
+    }
+    let at = token * slot_values() + index;
+    let activated = round_to_bf16(silu_of(round_to_bf16(gate[at])));
+    product[token * activation_stride() + index] = round_to_bf16(activated * round_to_bf16(up[at]));
+    return;
+}

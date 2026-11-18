@@ -1,0 +1,73 @@
+import kizukani::model;
+import std::array;
+import std::mem;
+import std::process;
+import std::rand;
+
+fn random_linear(allocator: Allocator, random: &var rand::Rng, codes: &array::Array<u32>, rows: i64, cols: i64) -> mem::Error!model::CompressedLinear {
+    var weight_table = array::new<i8>(allocator);
+    errdefer weight_table.deinit(allocator);
+    for 0..8192 |index| {
+        try weight_table.append(allocator, cast<i8>(random.below(255) - 127));
+    }
+    var effective_row_scales = array::new<f32>(allocator);
+    errdefer effective_row_scales.deinit(allocator);
+    for 0..rows |row| {
+        try effective_row_scales.append(allocator, cast<f32>(0.001));
+    }
+    var input_signs = array::new<i8>(allocator);
+    errdefer input_signs.deinit(allocator);
+    for 0..cols |col| {
+        try input_signs.append(allocator, 1);
+    }
+    let code_view = codes.as_slice();
+    // SAFETY: reading an address as an integer touches no memory.
+    let code_address = cast<u64>(unsafe int_from_ptr<usize>(ptr_of(code_view)));
+    return model::CompressedLinear {
+        rows: rows,
+        cols: cols,
+        physical_rows: rows,
+        bits_per_step: 6,
+        warp_layout: true,
+        code_address: code_address,
+        code_word_count: codes.len(),
+        weight_table: move weight_table,
+        effective_row_scales: move effective_row_scales,
+        input_signs: move input_signs,
+        output_signs: array::new<i8>(allocator),
+    };
+}
+
+pub fn run_cpu_projection_benchmark(thread_count: i64) -> !void {
+    let allocator = mem::page_allocator();
+    let rows: i64 = 17408;
+    let cols: i64 = 5120;
+    var random = rand::new(5);
+    var codes = array::new<u32>(allocator);
+    defer codes.deinit(allocator);
+    let word_count = rows * (cols / 256) * 24;
+    try codes.reserve(allocator, word_count);
+    for 0..word_count |index| {
+        try codes.append(allocator, cast<u32>(random.next() & 0xffffffff));
+    }
+    let linear = try random_linear(allocator, &var random, &codes, rows, cols);
+    defer linear.deinit(allocator);
+    var input = array::new<f32>(allocator);
+    defer input.deinit(allocator);
+    for 0..cols |col| {
+        try input.append(allocator, cast<f32>(random.below(2001) - 1000) / cast<f32>(1000.0));
+    }
+    let input_view = input.as_slice();
+    let signs = linear.input_signs.as_slice();
+    let activation = try model::quantize_activation(allocator, input_view, signs);
+    defer activation.deinit(allocator);
+    var projector = try model::new_cpu_projector(allocator, thread_count);
+    defer projector.deinit(allocator);
+    for 0..3 |round| {
+        let started = process::unix_millis();
+        let output = try model::project(allocator, &var projector, &linear, &activation, cast<f32>(1.0));
+        defer output.deinit(allocator);
+        print(process::unix_millis() - started);
+    }
+    return;
+}

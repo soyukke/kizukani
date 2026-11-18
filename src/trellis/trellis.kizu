@@ -1,0 +1,219 @@
+import kizukani::metal;
+import std::fs;
+import std::io;
+import std::mem;
+import std::rand;
+
+pub error MatvecError {
+    KernelFailed,
+}
+
+pub fn bits_per_step() -> i64 {
+    return 6;
+}
+
+pub fn state_bits() -> i64 {
+    return 12;
+}
+
+pub fn steps_per_sequence() -> i64 {
+    return 128;
+}
+
+pub fn weights_per_sequence() -> i64 {
+    return 256;
+}
+
+pub fn words_per_sequence() -> i64 {
+    return 4 * bits_per_step();
+}
+
+pub fn state_value_count() -> i64 {
+    return 8192;
+}
+
+pub fn rows_per_simdgroup() -> i64 {
+    return 32;
+}
+
+pub fn warp_layout_word_index(physical_rows: i64, row: i64, sequence: i64, word: i64) -> i64 {
+    let sequence_row = sequence * physical_rows + row;
+    let row_group = sequence_row / rows_per_simdgroup();
+    let lane = sequence_row % rows_per_simdgroup();
+    let word_quad = word / 4;
+    return ((row_group * bits_per_step() + word_quad) * rows_per_simdgroup() + lane) * 4 + word % 4;
+}
+
+fn sequence_code_bit(code_words: []u32, physical_rows: i64, row: i64, sequence: i64, bit: i64) -> u32 {
+    let word = code_words[warp_layout_word_index(physical_rows, row, sequence, bit / 32)];
+    return (word >> cast<u32>(bit % 32)) & 1;
+}
+
+pub fn step_state(code_words: []u32, physical_rows: i64, row: i64, sequence: i64, step: i64) -> i64 {
+    let first_bit = bits_per_step() * (step + 1) - state_bits();
+    var state: i64 = 0;
+    for 0..state_bits() |offset| {
+        let bit = first_bit + offset;
+        if bit >= 0 {
+            state = state | (cast<i64>(sequence_code_bit(code_words, physical_rows, row, sequence, bit)) << offset);
+        }
+    }
+    return state;
+}
+
+pub fn reference_row_dot_before_scale(code_words: []u32, state_values: []f32, x: []f32, physical_rows: i64, cols: i64, row: i64) -> f64 {
+    var total: f64 = 0.0;
+    for 0..(cols / weights_per_sequence()) |sequence| {
+        for 0..steps_per_sequence() |step| {
+            let state = step_state(code_words, physical_rows, row, sequence, step);
+            let column = sequence * weights_per_sequence() + 2 * step;
+            total = total + cast<f64>(state_values[2 * state]) * cast<f64>(x[column]);
+            total = total + cast<f64>(state_values[2 * state + 1]) * cast<f64>(x[column + 1]);
+        }
+    }
+    return total;
+}
+
+pub fn matvec_kernel_name() -> ptr<const u8> {
+    return c"trellis_matvec_six";
+}
+
+fn bind_values(pass: &metal::ComputePass, index: u64, values: []i64) -> void {
+    // SAFETY: the values are 8 * count readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(values));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, mem::count<i64>(values) * 8);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+pub fn code_stream_bytes(physical_rows: i64, cols: i64) -> u64 {
+    return cast<u64>(physical_rows * (cols / weights_per_sequence()) * words_per_sequence() * 4);
+}
+
+pub fn encode_matvec(pass: &metal::ComputePass, kernel: &metal::Kernel, physical_rows: i64, simdgroups_per_row_group: i64) -> void {
+    pass.dispatch_threadgroups(kernel, cast<u64>(physical_rows / rows_per_simdgroup()), cast<u64>(rows_per_simdgroup() * simdgroups_per_row_group));
+    return;
+}
+
+pub struct RandomMatvecRun {
+    pub best_gpu_seconds: f64,
+    pub worst_relative_error: f64,
+}
+
+fn absolute(value: f64) -> f64 {
+    if value < 0.0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn run_random_matvec(gpu: &metal::Gpu, physical_rows: i64, cols: i64, simdgroups_per_row_group: i64, rounds: i64, checked_row_stride: i64) -> !RandomMatvecRun {
+    let allocator = mem::page_allocator();
+    let path = "target/kernels.metal";
+    let source = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer source.deinit(allocator);
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let kernel = try library.kernel(gpu, matvec_kernel_name());
+    defer kernel.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    let code_word_count = cast<i64>(code_stream_bytes(physical_rows, cols) / 4);
+    let codes = try gpu.new_shared_buffer(code_stream_bytes(physical_rows, cols));
+    defer codes.release();
+    let state_values = try gpu.new_shared_buffer(cast<u64>(state_value_count() * 4));
+    defer state_values.release();
+    let row_scales = try gpu.new_shared_buffer(cast<u64>(physical_rows * 4));
+    defer row_scales.release();
+    let x = try gpu.new_shared_buffer(cast<u64>(cols * 4));
+    defer x.release();
+    let y = try gpu.new_shared_buffer(cast<u64>(physical_rows * 4));
+    defer y.release();
+
+    // SAFETY: each buffer was sized above for these element counts.
+    let code_cells = unsafe cast<ptr<u32>>(codes.contents());
+    // SAFETY: as above.
+    let state_value_cells = unsafe cast<ptr<f32>>(state_values.contents());
+    // SAFETY: as above.
+    let row_scale_cells = unsafe cast<ptr<f32>>(row_scales.contents());
+    // SAFETY: as above.
+    let x_cells = unsafe cast<ptr<f32>>(x.contents());
+    // SAFETY: as above.
+    let y_cells = unsafe cast<ptr<const f32>>(y.contents());
+    // SAFETY: as above.
+    let status_cells = unsafe cast<ptr<u32>>(status.contents());
+    // SAFETY: no GPU work uses these buffers until the passes below.
+    let code_words = unsafe mut_view_from_ptr(code_cells, code_word_count);
+    // SAFETY: as above.
+    let state_value_view = unsafe mut_view_from_ptr(state_value_cells, state_value_count());
+    // SAFETY: as above.
+    let row_scale_view = unsafe mut_view_from_ptr(row_scale_cells, physical_rows);
+    // SAFETY: as above.
+    let x_view = unsafe mut_view_from_ptr(x_cells, cols);
+    // SAFETY: as above.
+    let status_view = unsafe mut_view_from_ptr(status_cells, 1);
+
+    var random = rand::new(physical_rows * 7919 + cols);
+    for 0..code_word_count |i| {
+        code_words[i] = cast<u32>(random.next() & 0xffffffff);
+    }
+    for 0..state_value_count() |i| {
+        state_value_view[i] = cast<f32>(random.below(255) - 127) / 64.0;
+    }
+    for 0..physical_rows |i| {
+        row_scale_view[i] = 0.5 + cast<f32>(random.below(1024)) / 1024.0;
+    }
+    for 0..cols |i| {
+        x_view[i] = cast<f32>(random.below(2048) - 1024) / 1024.0;
+    }
+    status_view[0] = 0;
+    let shape = [3]i64{ physical_rows, cols / weights_per_sequence(), simdgroups_per_row_group };
+    let lengths = [5]i64{ code_word_count, state_value_count(), physical_rows, cols, physical_rows };
+
+    var best_gpu_seconds: f64 = 1.0e9;
+    for 0..rounds |round| {
+        let pass = try gpu.begin_compute_pass();
+        pass.bind_buffer(0, &codes);
+        pass.bind_buffer(1, &state_values);
+        pass.bind_buffer(2, &row_scales);
+        pass.bind_buffer(3, &x);
+        pass.bind_buffer(4, &y);
+        let shape_view = shape.as_slice();
+        bind_values(&pass, 5, shape_view[0..1]);
+        bind_values(&pass, 6, shape_view[1..2]);
+        bind_values(&pass, 7, shape_view[2..3]);
+        let length_view = lengths.as_slice();
+        bind_values(&pass, 8, length_view);
+        pass.bind_buffer(9, &status);
+        encode_matvec(&pass, &kernel, physical_rows, simdgroups_per_row_group);
+        let gpu_seconds = try pass.finish_and_measure_gpu_seconds();
+        if gpu_seconds < best_gpu_seconds {
+            best_gpu_seconds = gpu_seconds;
+        }
+    }
+
+    if status_view[0] != 0 {
+        return MatvecError::KernelFailed;
+    }
+    var worst_relative_error: f64 = 0.0;
+    if checked_row_stride > 0 {
+        // SAFETY: the passes have finished, so the CPU may read y.
+        let y_view = unsafe view_from_ptr(y_cells, physical_rows);
+        var row: i64 = 0;
+        while row < physical_rows {
+            let expected = reference_row_dot_before_scale(code_words, state_value_view, x_view, physical_rows, cols, row) * cast<f64>(row_scale_view[row]);
+            var magnitude = absolute(expected);
+            if magnitude < 1.0 {
+                magnitude = 1.0;
+            }
+            let relative_error = absolute(cast<f64>(y_view[row]) - expected) / magnitude;
+            if relative_error > worst_relative_error {
+                worst_relative_error = relative_error;
+            }
+            row = row + checked_row_stride;
+        }
+    }
+    return RandomMatvecRun { best_gpu_seconds: best_gpu_seconds, worst_relative_error: worst_relative_error };
+}

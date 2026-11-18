@@ -1,0 +1,54 @@
+import std::float;
+
+fn lane_sum(values: []f32) -> f32 {
+    var lanes = [32]f32{};
+    let lane_view = lanes.as_mut_slice();
+    for 0..32 |lane| {
+        lane_view[lane] = values[lane];
+    }
+    var offset: i64 = 16;
+    while offset >= 1 {
+        var next = [32]f32{};
+        let next_view = next.as_mut_slice();
+        for 0..32 |lane| {
+            next_view[lane] = lane_view[lane] + lane_view[lane ^ offset];
+        }
+        for 0..32 |lane| {
+            lane_view[lane] = next_view[lane];
+        }
+        offset = offset / 2;
+    }
+    return lane_view[0];
+}
+
+fn hadamard_on_cpu(values: &var []f32) -> void {
+    var half_width: i64 = 1;
+    while half_width < 512 {
+        for 0..256 |thread| {
+            let below = thread & (half_width - 1);
+            let lower = (thread - below) * 2 + below;
+            let upper = lower + half_width;
+            let low = values[lower];
+            let high = values[upper];
+            values[lower] = low + high;
+            values[upper] = low - high;
+        }
+        half_width = half_width * 2;
+    }
+    return;
+}
+
+fn flushed(value: f32) -> f32 {
+    let bits = float::bits_f32(value);
+    if (bits & 0x7f800000) == 0 {
+        return float::from_bits_f32(bits & 0x80000000);
+    }
+    return value;
+}
+
+fn same_float_bits(left: u32, right: u32) -> bool {
+    if left == right {
+        return true;
+    }
+    return (left & 0x7fffffff) > 0x7f800000 and (right & 0x7fffffff) > 0x7f800000;
+}

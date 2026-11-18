@@ -1,0 +1,144 @@
+import kizukani::mapped;
+import kizukani::yskn;
+import std::array;
+import std::fs;
+import std::io;
+import std::math;
+import std::mem;
+import std::rand;
+import std::testing;
+
+fn relative_error_against_exact_product(name: []u8) -> !f64 {
+    let allocator = mem::page_allocator();
+    let file_text = try fs::read_file(io::blocking(), allocator, "testdata/tiny.yskn", mem::Limit::Unlimited);
+    defer file_text.deinit(allocator);
+    let file = file_text.as_bytes();
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(ptr_of(file)));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    let index = yskn::find_tensor(&header, name) orelse return ModelError::MissingTensor;
+    var projector = try new_cpu_projector(allocator, 4);
+    defer projector.deinit(allocator);
+
+    if header.tensors.at(index) |tensor| {
+        var linear = try load_compressed_linear(allocator, file, file_address, tensor);
+        defer linear.deinit(allocator);
+        var random = rand::new(17);
+        var input = array::new<f32>(allocator);
+        defer input.deinit(allocator);
+        for 0..tensor.cols |col| {
+            try input.append(allocator, cast<f32>(random.below(2001) - 1000) / cast<f32>(1000.0));
+        }
+        let input_view = input.as_slice();
+        let signs = linear.input_signs.as_slice();
+        var activation = try quantize_activation(allocator, input_view, signs);
+        defer activation.deinit(allocator);
+        let output = try project(allocator, &var projector, &linear, &activation, cast<f32>(1.0));
+        defer output.deinit(allocator);
+        let output_view = output.as_slice();
+
+        var weights = array::new<f32>(allocator);
+        defer weights.deinit(allocator);
+        for 0..(tensor.rows * tensor.cols) |cell| {
+            try weights.append(allocator, cast<f32>(0.0));
+        }
+        let weight_view = weights.as_mut_slice();
+        var row_values = array::new<f32>(allocator);
+        defer row_values.deinit(allocator);
+        for 0..tensor.cols |col| {
+            try row_values.append(allocator, cast<f32>(0.0));
+        }
+        let row_view = row_values.as_mut_slice();
+        for 0..tensor.rows |row| {
+            yskn::fill_rotated_row(file, tensor, row, &var row_view);
+            for 0..tensor.cols |col| {
+                weight_view[row * tensor.cols + col] = row_view[col];
+            }
+        }
+        yskn::restore_original_coordinates(tensor, &var weight_view);
+        var error_square: f64 = 0.0;
+        var exact_square: f64 = 0.0;
+        for 0..tensor.rows |row| {
+            var exact: f64 = 0.0;
+            for 0..tensor.cols |col| {
+                exact = exact + cast<f64>(weight_view[row * tensor.cols + col]) * cast<f64>(input_view[col]);
+            }
+            let difference = cast<f64>(output_view[row]) - exact;
+            error_square = error_square + difference * difference;
+            exact_square = exact_square + exact * exact;
+        }
+        return math::sqrt<f64>(error_square / exact_square);
+    }
+    return ModelError::MissingTensor;
+}
+
+test "projection of a rotated 6-bit matrix is within int8 noise of the exact product" {
+    testing::expect(try relative_error_against_exact_product("tiny.body6") < 0.02);
+}
+
+test "projection of a rotated 8-bit matrix is within int8 noise of the exact product" {
+    testing::expect(try relative_error_against_exact_product("tiny.body8") < 0.02);
+}
+
+test "projection of an unrotated head is within int8 noise of the exact product" {
+    testing::expect(try relative_error_against_exact_product("tiny.head") < 0.02);
+}
+
+fn gpu_and_thread_projections_agree_bit_for_bit(name: []u8) -> !bool {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(c"testdata/tiny.yskn");
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    let index = yskn::find_tensor(&header, name) orelse return ModelError::MissingTensor;
+    var thread_projector = try new_cpu_projector(allocator, 4);
+    defer thread_projector.deinit(allocator);
+    // SAFETY: the mapping outlives the projector, which is released first.
+    var gpu_projector = try unsafe new_gpu_projector(allocator, 4, file_address, cast<u64>(mapping.length()));
+    defer gpu_projector.deinit(allocator);
+
+    if header.tensors.at(index) |tensor| {
+        var linear = try load_compressed_linear(allocator, file, file_address, tensor);
+        defer linear.deinit(allocator);
+        var random = rand::new(29);
+        var input = array::new<f32>(allocator);
+        defer input.deinit(allocator);
+        for 0..tensor.cols |col| {
+            try input.append(allocator, cast<f32>(random.below(2001) - 1000) / cast<f32>(1000.0));
+        }
+        let input_view = input.as_slice();
+        let signs = linear.input_signs.as_slice();
+        var activation = try quantize_activation(allocator, input_view, signs);
+        defer activation.deinit(allocator);
+        let on_threads = try project(allocator, &var thread_projector, &linear, &activation, cast<f32>(0.75));
+        defer on_threads.deinit(allocator);
+        let on_gpu = try project(allocator, &var gpu_projector, &linear, &activation, cast<f32>(0.75));
+        defer on_gpu.deinit(allocator);
+        let thread_view = on_threads.as_slice();
+        let gpu_view = on_gpu.as_slice();
+        for 0..tensor.rows |row| {
+            if yskn::binary32_bits(thread_view[row]) != yskn::binary32_bits(gpu_view[row]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return ModelError::MissingTensor;
+}
+
+test "gpu row sums reproduce the thread projection of a 6-bit matrix bit for bit" {
+    testing::expect(try gpu_and_thread_projections_agree_bit_for_bit("tiny.body6"));
+}
+
+test "gpu row sums reproduce the thread projection of an 8-bit matrix bit for bit" {
+    testing::expect(try gpu_and_thread_projections_agree_bit_for_bit("tiny.body8"));
+}
+
+test "gpu row sums reproduce the thread projection of an 8-bit head bit for bit" {
+    testing::expect(try gpu_and_thread_projections_agree_bit_for_bit("tiny.head"));
+}

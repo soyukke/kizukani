@@ -1,0 +1,193 @@
+import kizukani::metal;
+import std::float;
+import std::math;
+import std::mem;
+import std::testing;
+
+fn prepare_mismatches(width: i64, normalized: u32) -> !i64 {
+    let allocator = mem::page_allocator();
+    let source = try generated_kernel_source(allocator);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let generated = try library.kernel(&gpu, c"prepare_activation");
+    defer generated.release();
+    let finishing = try library.kernel(&gpu, c"finish_activation");
+    defer finishing.release();
+    let blocks = width / 512;
+    let input = try gpu.new_shared_buffer(cast<u64>(width * 4));
+    defer input.release();
+    let norm = try gpu.new_shared_buffer(cast<u64>(width * 4));
+    defer norm.release();
+    let signs = try gpu.new_shared_buffer(cast<u64>(width));
+    defer signs.release();
+    fill_moderate(&input, width, 41);
+    fill_moderate(&norm, width, 42);
+    // SAFETY: the sign buffer holds width bytes, and no GPU work uses it yet.
+    let sign_view = unsafe mut_view_from_ptr(unsafe cast<ptr<i8>>(signs.contents()), width);
+    for 0..width |index| {
+        sign_view[index] = cast<i8>((index % 3) - 1);
+        if sign_view[index] == 0 {
+            sign_view[index] = 1;
+        }
+    }
+    let activation_a = try gpu.new_shared_buffer(cast<u64>(width));
+    defer activation_a.release();
+    let weights_a = try gpu.new_shared_buffer(cast<u64>(blocks * 8));
+    defer weights_a.release();
+    let scalars_a = try gpu.new_shared_buffer(8);
+    defer scalars_a.release();
+    let weighted_a = try gpu.new_shared_buffer(cast<u64>(width * 4));
+    defer weighted_a.release();
+    let floats = try gpu.new_shared_buffer(cast<u64>(width * 4 * 8));
+    defer floats.release();
+    let batch_weights = try gpu.new_shared_buffer(cast<u64>(blocks * 8 * 8));
+    defer batch_weights.release();
+    let block_scales = try gpu.new_shared_buffer(256);
+    defer block_scales.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    clear_status(&status);
+
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &input);
+    pass.bind_buffer(1, &norm);
+    pass.bind_buffer(2, &signs);
+    pass.bind_buffer(3, &activation_a);
+    pass.bind_buffer(4, &scalars_a);
+    pass.bind_buffer(5, &weighted_a);
+    pass.bind_buffer(6, &floats);
+    pass.bind_buffer(7, &block_scales);
+    let width_words = [1]i64{ width };
+    let width_view = width_words.as_slice();
+    bind_i64_values(&pass, 8, width_view);
+    let flag = [1]u32{ normalized };
+    let flag_view = flag.as_slice();
+    bind_u32_values(&pass, 9, flag_view);
+    bind_i64_values(&pass, 10, width_view);
+    let lengths = [8]i64{ width, width, width, width, 2, width, width * 8, 64 };
+    let length_view = lengths.as_slice();
+    bind_i64_values(&pass, 11, length_view);
+    pass.bind_buffer(12, &status);
+    pass.dispatch_threadgroups(&generated, cast<u64>(blocks), 512);
+    pass.bind_buffer(0, &block_scales);
+    pass.bind_buffer(1, &weights_a);
+    pass.bind_buffer(2, &batch_weights);
+    pass.bind_buffer(3, &scalars_a);
+    bind_i64_values(&pass, 4, width_view);
+    let token_count = [1]i64{ 1 };
+    let token_count_view = token_count.as_slice();
+    bind_i64_values(&pass, 5, token_count_view);
+    let finish_lengths = [4]i64{ 64, blocks, blocks * 8, 2 };
+    let finish_length_view = finish_lengths.as_slice();
+    bind_i64_values(&pass, 6, finish_length_view);
+    pass.bind_buffer(7, &status);
+    pass.dispatch_threadgroups(&finishing, 1, 32);
+    try pass.finish();
+    testing::expect_equal<u32>(0, status_word(&status));
+    // SAFETY: the pass finished, and the buffer holds width f32.
+    let input_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(input.contents()), width);
+    // SAFETY: the pass finished, and the buffer holds width f32.
+    let norm_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(norm.contents()), width);
+    var inverse_rms = one();
+    if normalized != 0 {
+        var total: f32 = 0.0;
+        var lanes = [32]f32{};
+        let lane_view = lanes.as_mut_slice();
+        for 0..blocks |block| {
+            for 0..4 |simdgroup| {
+                for 0..32 |lane| {
+                    var sum: f32 = 0.0;
+                    for 0..4 |group| {
+                        let value = input_view[block * 512 + simdgroup * 32 + lane + 128 * group];
+                        sum = sum + value * value;
+                    }
+                    lane_view[lane] = sum;
+                }
+                total = total + lane_sum(lane_view);
+            }
+        }
+        inverse_rms = one() / math::sqrt<f32>(total / cast<f32>(width) + model_epsilon());
+    }
+    // SAFETY: the pass finished, and the buffer holds width i8.
+    let got_activation = unsafe view_from_ptr(unsafe cast<ptr<const i8>>(activation_a.contents()), width);
+    // SAFETY: the pass finished, and the buffer holds blocks i64.
+    let got_weights = unsafe view_from_ptr(unsafe cast<ptr<const i64>>(weights_a.contents()), blocks);
+    // SAFETY: the pass finished, and the buffer holds 2 u32.
+    let got_scalars = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(scalars_a.contents()), 2);
+    // SAFETY: the pass finished, and the buffer holds width u32.
+    let got_weighted = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(weighted_a.contents()), width);
+    var mismatches: i64 = 0;
+    var scale_cells = [64]f32{};
+    let scale_view = scale_cells.as_mut_slice();
+    var rotated = [512]f32{};
+    var rotated_view = rotated.as_mut_slice();
+    for 0..blocks |block| {
+        for 0..512 |local| {
+            let index = block * 512 + local;
+            var adjusted = input_view[index];
+            if normalized != 0 {
+                adjusted = adjusted * (one() + norm_view[index]);
+                if !same_float_bits(got_weighted[index], float::bits_f32(round_to_bf16(adjusted))) {
+                    mismatches = mismatches + 1;
+                }
+            }
+            rotated_view[local] = adjusted * cast<f32>(sign_view[index]);
+        }
+        hadamard_on_cpu(&var rotated_view);
+        var maximum: f32 = 0.0;
+        for 0..512 |local| {
+            rotated_view[local] = round_to_f16(rotated_view[local] * inverse_sqrt_hadamard_width());
+            maximum = larger(maximum, absolute(rotated_view[local]));
+        }
+        let scale = maximum / float::from_bits_f32(0x42fe0000);
+        scale_view[block] = scale;
+        for 0..512 |local| {
+            var ratio: f32 = 0.0;
+            if scale > 0.0 {
+                ratio = rotated_view[local] / scale;
+            }
+            var clamped = round_half_even(ratio);
+            if clamped < -float::from_bits_f32(0x42fe0000) {
+                clamped = -float::from_bits_f32(0x42fe0000);
+            }
+            if clamped > float::from_bits_f32(0x42fe0000) {
+                clamped = float::from_bits_f32(0x42fe0000);
+            }
+            if got_activation[block * 512 + local] != cast<i8>(clamped) {
+                mismatches = mismatches + 1;
+            }
+        }
+    }
+    var maximum_scale: f32 = 0.0;
+    for 0..blocks |block| {
+        maximum_scale = larger(maximum_scale, scale_view[block]);
+    }
+    var multiplier: f32 = 0.0;
+    if maximum_scale > 0.0 {
+        multiplier = float::from_bits_f32(0x4b800000) / maximum_scale;
+    }
+    for 0..blocks |block| {
+        if got_weights[block] != cast<i64>(round_half_even(scale_view[block] * multiplier)) {
+            mismatches = mismatches + 1;
+        }
+    }
+    if got_scalars[0] != float::bits_f32(inverse_rms) {
+        mismatches = mismatches + 1;
+    }
+    if got_scalars[1] != float::bits_f32(maximum_scale * float::from_bits_f32(0x33800000)) {
+        mismatches = mismatches + 1;
+    }
+    return mismatches;
+}
+
+test "the prepare_activation kernel matches the cpu preparation when normalizing" {
+    testing::expect_equal<i64>(0, try prepare_mismatches(5120, 1));
+}
+
+test "the prepare_activation kernel matches the cpu preparation without normalizing" {
+    testing::expect_equal<i64>(0, try prepare_mismatches(17408, 0));
+}

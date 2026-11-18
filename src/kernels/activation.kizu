@@ -1,0 +1,134 @@
+import std::float;
+import std::gpu;
+
+export "gpu" fn prepare_activation(
+    input: []f32,
+    norm_weight: []f32,
+    signs: []i8,
+    activation: &var []i8,
+    scalars: &var []f32,
+    weighted_bf16: &var []f32,
+    activation_halves: &var []u16,
+    block_scales: &var []f32,
+    width: i64,
+    normalized: u32,
+    input_stride: i64
+) -> void {
+    var rotated_storage = gpu::group_array<[512]f32>();
+    var partial_storage = gpu::group_array<[256]f32>();
+    var maxima_storage = gpu::group_array<[16]f32>();
+    var scale_storage = gpu::group_array<[1]f32>();
+    var rms_storage = gpu::group_array<[1]f32>();
+    var rotated = rotated_storage.as_mut_slice();
+    let partial_sums = partial_storage.as_mut_slice();
+    let simdgroup_maxima = maxima_storage.as_mut_slice();
+    let shared_scale = scale_storage.as_mut_slice();
+    let shared_inverse_rms = rms_storage.as_mut_slice();
+    let blocks = width / 512;
+    let token = gpu::group_index() / blocks;
+    let block = gpu::group_index() % blocks;
+    let source_first = token * input_stride;
+    let source = input[source_first..source_first + width];
+    let thread_in_group = gpu::local_index();
+    let lane = gpu::lane_index();
+    let simdgroup = gpu::simdgroup_index();
+    var inverse_rms = one();
+    if normalized != 0 {
+        var summed = simdgroup >> 2;
+        let quarter = simdgroup & 3;
+        while summed < blocks {
+            var sum: f32 = 0.0;
+            for 0..4 |group| {
+                let value = source[summed * 512 + quarter * 32 + lane + 128 * group];
+                sum = sum + value * value;
+            }
+            sum = xor_reduce_32(sum);
+            if lane == 0 {
+                partial_sums[summed * 4 + quarter] = sum;
+            }
+            summed = summed + 4;
+        }
+        gpu::barrier();
+        if thread_in_group == 0 {
+            var total: f32 = 0.0;
+            for 0..(blocks * 4) |part| {
+                total = total + partial_sums[part];
+            }
+            shared_inverse_rms[0] = one() / gpu::sqrt(total / cast<f32>(width) + model_epsilon());
+        }
+        gpu::barrier();
+        inverse_rms = shared_inverse_rms[0];
+    }
+    let index = block * 512 + thread_in_group;
+    var adjusted = source[index];
+    if normalized != 0 {
+        adjusted = adjusted * (one() + norm_weight[index]);
+        weighted_bf16[token * hidden_stride() + index] = round_to_bf16(adjusted);
+    }
+    rotated[thread_in_group] = adjusted * cast<f32>(signs[index]);
+    hadamard_in_group(&var rotated, thread_in_group);
+    let rounded = round_to_f16(rotated[thread_in_group] * inverse_sqrt_hadamard_width());
+    let simdgroup_maximum = gpu::simd_max(absolute(rounded));
+    if lane == 0 {
+        simdgroup_maxima[simdgroup] = simdgroup_maximum;
+    }
+    gpu::barrier();
+    if thread_in_group == 0 {
+        var maximum: f32 = 0.0;
+        for 0..16 |group| {
+            maximum = larger(maximum, simdgroup_maxima[group]);
+        }
+        let block_scale = maximum / float::from_bits_f32(0x42fe0000);
+        shared_scale[0] = block_scale;
+        block_scales[token * 64 + block] = block_scale;
+        if block == 0 {
+            scalars[token * scalar_stride()] = inverse_rms;
+        }
+    }
+    gpu::barrier();
+    let scale = shared_scale[0];
+    var ratio: f32 = 0.0;
+    if scale > 0.0 {
+        ratio = rounded / scale;
+    }
+    var clamped = round_half_even(ratio);
+    if clamped < -float::from_bits_f32(0x42fe0000) {
+        clamped = -float::from_bits_f32(0x42fe0000);
+    }
+    if clamped > float::from_bits_f32(0x42fe0000) {
+        clamped = float::from_bits_f32(0x42fe0000);
+    }
+    activation[token * activation_stride() + index] = cast<i8>(clamped);
+    activation_halves[((index >> 8) * batch_capacity() + token) * 256 + (index & 255)] = gpu::half_from_f32(clamped);
+    return;
+}
+
+export "gpu" fn finish_activation(
+    block_scales: []f32,
+    block_weights: &var []i64,
+    batch_block_weights: &var []i64,
+    scalars: &var []f32,
+    width: i64,
+    token_count: i64
+) -> void {
+    let token = gpu::thread_index();
+    if token >= token_count {
+        return;
+    }
+    let blocks = width / 512;
+    var maximum_scale: f32 = 0.0;
+    for 0..blocks |block| {
+        maximum_scale = larger(maximum_scale, block_scales[token * 64 + block]);
+    }
+    var multiplier: f32 = 0.0;
+    if maximum_scale > 0.0 {
+        multiplier = float::from_bits_f32(0x4b800000) / maximum_scale;
+    }
+    for 0..blocks |block| {
+        let weight = cast<i64>(round_half_even(block_scales[token * 64 + block] * multiplier));
+        block_weights[token * block_stride() + block] = weight;
+        batch_block_weights[block * batch_capacity() + token] = weight;
+    }
+    scalars[token * scalar_stride() + 1] = maximum_scale * float::from_bits_f32(0x33800000);
+    return;
+}

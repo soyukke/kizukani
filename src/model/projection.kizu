@@ -1,0 +1,499 @@
+import kizukani::metal;
+import kizukani::yskn;
+import std::io;
+import std::array;
+import std::math;
+import std::fs;
+import std::mem;
+import std::thread;
+
+pub error ModelError {
+    MisalignedCodeStream,
+    ShapeMismatch,
+    MissingTensor,
+    MissingVector,
+    UnsupportedModel,
+    KernelFailed,
+}
+
+pub error ProjectionError = ModelError or thread::Error or mem::Error or metal::MetalError or fs::Error;
+
+pub struct CompressedLinear {
+    pub rows: i64,
+    pub cols: i64,
+    pub physical_rows: i64,
+    pub bits_per_step: i64,
+    pub warp_layout: bool,
+    pub code_address: u64,
+    pub code_word_count: i64,
+    pub weight_table: array::Array<i8>,
+    pub effective_row_scales: array::Array<f32>,
+    pub input_signs: array::Array<i8>,
+    pub output_signs: array::Array<i8>,
+}
+
+pub struct QuantizedActivation {
+    pub values: array::Array<i8>,
+    pub block_weights: array::Array<i64>,
+    pub quantum: f32,
+}
+
+pub struct ProjectionJob {
+    code_address: u64,
+    code_word_count: i64,
+    bits_per_step: i64,
+    warp_layout: bool,
+    physical_rows: i64,
+    sequences_per_row: i64,
+    weight_table_address: u64,
+    activation_address: u64,
+    activation_count: i64,
+    block_weight_address: u64,
+    rows_per_chunk: i64,
+}
+
+pub struct Projector {
+    pool: thread::Pool,
+    jobs: array::Array<ProjectionJob>,
+    sums: RowSumBackend,
+}
+
+pub union RowSumBackend {
+    Threads,
+    Gpu(mem::Box<GpuLinearSums>),
+}
+
+pub fn new_cpu_projector(allocator: Allocator, thread_count: i64) -> ProjectionError!Projector {
+    var pool = try thread::init(io::blocking(), allocator, thread_count);
+    errdefer pool.deinit(allocator);
+    let jobs = try new_projection_jobs(allocator, &pool);
+    return Projector { pool: move pool, jobs: move jobs, sums: RowSumBackend::Threads };
+}
+
+/// file_address is the page-aligned start of a mapping of file_byte_count bytes that outlives the result.
+pub unsafe fn new_gpu_projector(allocator: Allocator, thread_count: i64, file_address: u64, file_byte_count: u64) -> ProjectionError!Projector {
+    var pool = try thread::init(io::blocking(), allocator, thread_count);
+    errdefer pool.deinit(allocator);
+    var jobs = try new_projection_jobs(allocator, &pool);
+    errdefer jobs.deinit(allocator);
+    // SAFETY: the caller keeps the mapping, as this function requires.
+    let gpu_sums = try unsafe open_gpu_linear_sums(allocator, file_address, file_byte_count);
+    let boxed_gpu_sums = try mem::box<GpuLinearSums>(allocator, move gpu_sums);
+    return Projector { pool: move pool, jobs: move jobs, sums: RowSumBackend::Gpu(move boxed_gpu_sums) };
+}
+
+fn (self: RowSumBackend) deinit(allocator: Allocator) -> void {
+    match self {
+        Gpu(gpu_sums) => gpu_sums.deinit(allocator),
+        Threads => {},
+    }
+}
+
+pub fn rows_per_chunk() -> i64 {
+    return 32;
+}
+
+pub fn integer_scale_range() -> f32 {
+    return cast<f32>(16777216.0);
+}
+
+pub fn integer_scale_quantum() -> f32 {
+    return yskn::binary32_from_bits(0x33800000);
+}
+
+pub fn new_projection_jobs(allocator: Allocator, pool: &thread::Pool) -> mem::Error!array::Array<ProjectionJob> {
+    var jobs = array::new<ProjectionJob>(allocator);
+    errdefer jobs.deinit(allocator);
+    for 0..pool.threads() |index| {
+        try jobs.append(allocator, ProjectionJob {
+            code_address: 0,
+            code_word_count: 0,
+            bits_per_step: 0,
+            warp_layout: false,
+            physical_rows: 0,
+            sequences_per_row: 0,
+            weight_table_address: 0,
+            activation_address: 0,
+            activation_count: 0,
+            block_weight_address: 0,
+            rows_per_chunk: rows_per_chunk(),
+        });
+    }
+    return move jobs;
+}
+
+fn append_signs(allocator: Allocator, signs: &var array::Array<i8>, rotation: yskn::SignedHadamard, count: i64) -> mem::Error!void {
+    for 0..count |position| {
+        try signs.append(allocator, yskn::stream_sign(rotation.sign_rule, rotation.sign_seed, rotation.sign_offset + cast<u64>(position)));
+    }
+    return;
+}
+
+pub fn load_compressed_linear(allocator: Allocator, file: []u8, file_address: u64, tensor: &yskn::TensorRecord) -> ProjectionError!CompressedLinear {
+    if tensor.code_offset % 4 != 0 {
+        return ModelError::MisalignedCodeStream;
+    }
+    var table_maximum: f32 = 0.0;
+    for 0..8192 |index| {
+        let value = math::abs<f32>(yskn::state_value(file, tensor, index));
+        if value > table_maximum {
+            table_maximum = value;
+        }
+    }
+    let table_scale = table_maximum / cast<f32>(127.0);
+    var weight_table = array::new<i8>(allocator);
+    errdefer weight_table.deinit(allocator);
+    for 0..8192 |index| {
+        let ratio = yskn::state_value(file, tensor, index) / table_scale;
+        let rounded = math::clamp<f32>(math::round_even<f32>(ratio), -127.0, 127.0);
+        try weight_table.append(allocator, cast<i8>(rounded));
+    }
+    var effective_row_scales = array::new<f32>(allocator);
+    errdefer effective_row_scales.deinit(allocator);
+    for 0..tensor.physical_rows |row| {
+        try effective_row_scales.append(allocator, yskn::row_scale(file, tensor, row) * table_scale);
+    }
+    var input_signs = array::new<i8>(allocator);
+    errdefer input_signs.deinit(allocator);
+    try append_signs(allocator, &var input_signs, tensor.input_rotation, tensor.cols);
+    var output_signs = array::new<i8>(allocator);
+    errdefer output_signs.deinit(allocator);
+    match tensor.output_rotation {
+        Rotated(rotation) => try append_signs(allocator, &var output_signs, rotation, tensor.physical_rows),
+        Unrotated => {},
+    }
+    let warp_layout = match tensor.layout {
+        Warp => true,
+        Row => false,
+    };
+    return CompressedLinear {
+        rows: tensor.rows,
+        cols: tensor.cols,
+        physical_rows: tensor.physical_rows,
+        bits_per_step: tensor.bits_per_step,
+        warp_layout: warp_layout,
+        code_address: file_address + cast<u64>(tensor.code_offset),
+        code_word_count: tensor.code_byte_count / 4,
+        weight_table: move weight_table,
+        effective_row_scales: move effective_row_scales,
+        input_signs: move input_signs,
+        output_signs: move output_signs,
+    };
+}
+
+pub fn quantize_activation(allocator: Allocator, input: []f32, signs: []i8) -> ProjectionError!QuantizedActivation {
+    let count = mem::count<f32>(input);
+    if count % 512 != 0 or mem::count<i8>(signs) != count {
+        return ModelError::ShapeMismatch;
+    }
+    let block_count = count / 512;
+    var values = array::new<i8>(allocator);
+    errdefer values.deinit(allocator);
+    var block_scales = array::new<f32>(allocator);
+    defer block_scales.deinit(allocator);
+    var rotated = [512]f32{};
+    let rotated_view = rotated.as_mut_slice();
+    for 0..block_count |block| {
+        let start = block * 512;
+        for 0..512 |channel| {
+            rotated_view[channel] = input[start + channel] * cast<f32>(signs[start + channel]);
+        }
+        unnormalized_hadamard_in_place(&var rotated_view, 0);
+        var maximum: f32 = 0.0;
+        for 0..512 |channel| {
+            rotated_view[channel] = round_to_f16(rotated_view[channel] * inverse_sqrt_hadamard_width());
+            let magnitude = math::abs<f32>(rotated_view[channel]);
+            if magnitude > maximum {
+                maximum = magnitude;
+            }
+        }
+        let scale = maximum / cast<f32>(127.0);
+        try block_scales.append(allocator, scale);
+        for 0..512 |channel| {
+            var ratio: f32 = 0.0;
+            if scale > cast<f32>(0.0) {
+                ratio = rotated_view[channel] / scale;
+            }
+            try values.append(allocator, cast<i8>(math::clamp<f32>(math::round_even<f32>(ratio), -127.0, 127.0)));
+        }
+    }
+    var maximum_scale: f32 = 0.0;
+    for 0..block_count |block| {
+        let scale = block_scales.get_or_panic(block);
+        if scale > maximum_scale {
+            maximum_scale = scale;
+        }
+    }
+    var multiplier: f32 = 0.0;
+    if maximum_scale > cast<f32>(0.0) {
+        multiplier = integer_scale_range() / maximum_scale;
+    }
+    var block_weights = array::new<i64>(allocator);
+    errdefer block_weights.deinit(allocator);
+    for 0..block_count |block| {
+        try block_weights.append(allocator, cast<i64>(math::round_even<f32>(block_scales.get_or_panic(block) * multiplier)));
+    }
+    return QuantizedActivation { values: move values, block_weights: move block_weights, quantum: maximum_scale * integer_scale_quantum() };
+}
+
+fn sum_rows(job: &var ProjectionJob, sums: &var []i64, chunk_index: i64) -> ProjectionError!void {
+    // SAFETY: code_address is the start of a mapped code stream of code_word_count aligned words that outlives the projection.
+    let code_cells = unsafe ptr_from_int<ptr<const u32>>(cast<usize>(job.code_address));
+    // SAFETY: as above.
+    let codes = unsafe view_from_ptr(code_cells, job.code_word_count);
+    // SAFETY: weight_table_address is the 8192-entry table of the linear being projected.
+    let table_cells = unsafe ptr_from_int<ptr<const i8>>(cast<usize>(job.weight_table_address));
+    // SAFETY: as above.
+    let table = unsafe view_from_ptr(table_cells, 8192);
+    // SAFETY: activation_address holds activation_count values for the duration of the call.
+    let activation_cells = unsafe ptr_from_int<ptr<const i8>>(cast<usize>(job.activation_address));
+    // SAFETY: as above.
+    let activation = unsafe view_from_ptr(activation_cells, job.activation_count);
+    // SAFETY: block_weight_address holds one weight per 512 activation values.
+    let weight_cells = unsafe ptr_from_int<ptr<const i64>>(cast<usize>(job.block_weight_address));
+    // SAFETY: as above.
+    let block_weights = unsafe view_from_ptr(weight_cells, job.activation_count / 512);
+
+    let bits = job.bits_per_step;
+    let words_per_sequence = 4 * bits;
+    var words = [33]u32{};
+    let word_view = words.as_mut_slice();
+    let first_row = chunk_index * job.rows_per_chunk;
+    for 0..mem::count<i64>(sums.*) |local_row| {
+        let row = first_row + local_row;
+        var total: i64 = 0;
+        for 0..(job.sequences_per_row / 2) |block| {
+            var block_sum: i64 = 0;
+            for 0..2 |half| {
+                let sequence = 2 * block + half;
+                if job.warp_layout {
+                    let sequence_row = sequence * job.physical_rows + row;
+                    let base = (sequence_row / 32) * bits * 128 + (sequence_row % 32) * 4;
+                    for 0..words_per_sequence |word| {
+                        word_view[word] = codes[base + (word / 4) * 128 + word % 4];
+                    }
+                } else {
+                    let base = (row * job.sequences_per_row + sequence) * words_per_sequence;
+                    for 0..words_per_sequence |word| {
+                        word_view[word] = codes[base + word];
+                    }
+                }
+                word_view[words_per_sequence] = 0;
+                let column_base = sequence * 256;
+                for 0..128 |step| {
+                    let first_bit = bits * (step + 1) - 12;
+                    var state: u32 = 0;
+                    if first_bit < 0 {
+                        state = (word_view[0] << cast<u32>(-first_bit)) & 0xfff;
+                    } else {
+                        let at = first_bit / 32;
+                        let offset = first_bit % 32;
+                        if offset <= 20 {
+                            state = (word_view[at] >> cast<u32>(offset)) & 0xfff;
+                        } else {
+                            state = ((word_view[at] >> cast<u32>(offset)) | (word_view[at + 1] << cast<u32>(32 - offset))) & 0xfff;
+                        }
+                    }
+                    let pair = 2 * cast<i64>(state);
+                    let column = column_base + 2 * step;
+                    block_sum = block_sum + cast<i64>(table[pair]) * cast<i64>(activation[column]) + cast<i64>(table[pair + 1]) * cast<i64>(activation[column + 1]);
+                }
+            }
+            total = total + block_weights[block] * block_sum;
+        }
+        sums[local_row] = total;
+    }
+    return;
+}
+
+fn address_of_i8(values: &array::Array<i8>) -> u64 {
+    let view = values.as_slice();
+    // SAFETY: reading an address as an integer touches no memory.
+    return cast<u64>(unsafe int_from_ptr<usize>(ptr_of(view)));
+}
+
+fn address_of_i64(values: &array::Array<i64>) -> u64 {
+    let view = values.as_slice();
+    // SAFETY: reading an address as an integer touches no memory.
+    return cast<u64>(unsafe int_from_ptr<usize>(ptr_of(view)));
+}
+
+fn sum_rows_on_threads(projector: &var Projector, linear: &CompressedLinear, activation: &QuantizedActivation, sums: &var []i64) -> ProjectionError!void {
+    let weight_table_address = address_of_i8(&linear.weight_table);
+    let activation_address = address_of_i8(&activation.values);
+    let block_weight_address = address_of_i64(&activation.block_weights);
+    for 0..projector.jobs.len() |index| {
+        if projector.jobs.at_mut(index) |job| {
+            job.code_address = linear.code_address;
+            job.code_word_count = linear.code_word_count;
+            job.bits_per_step = linear.bits_per_step;
+            job.warp_layout = linear.warp_layout;
+            job.physical_rows = linear.physical_rows;
+            job.sequences_per_row = linear.cols / 256;
+            job.weight_table_address = weight_table_address;
+            job.activation_address = activation_address;
+            job.activation_count = linear.cols;
+            job.block_weight_address = block_weight_address;
+            job.rows_per_chunk = rows_per_chunk();
+        }
+    }
+    try thread::each_with<i64, ProjectionJob, ProjectionError>(&var projector.pool, sums, rows_per_chunk(), &var projector.jobs, sum_rows);
+    return;
+}
+
+fn zero_sums(allocator: Allocator, linear: &CompressedLinear, activation: &QuantizedActivation) -> ProjectionError!array::Array<i64> {
+    if activation.values.len() != linear.cols {
+        return ModelError::ShapeMismatch;
+    }
+    var sums = array::new<i64>(allocator);
+    errdefer sums.deinit(allocator);
+    try sums.reserve(allocator, linear.physical_rows);
+    for 0..linear.physical_rows |row| {
+        try sums.append(allocator, 0);
+    }
+    return move sums;
+}
+
+fn require_gpu_support(linear: &CompressedLinear) -> ModelError!void {
+    if !supports_linear(linear) {
+        return ModelError::UnsupportedModel;
+    }
+    return;
+}
+
+fn restore_rows(allocator: Allocator, linear: &CompressedLinear, activation: &QuantizedActivation, inverse_rms: f32, sums: []i64) -> ProjectionError!array::Array<f32> {
+    var restored = array::new<f32>(allocator);
+    defer restored.deinit(allocator);
+    try restored.reserve(allocator, linear.physical_rows);
+    let scales = linear.effective_row_scales.as_slice();
+    for 0..linear.physical_rows |row| {
+        try restored.append(allocator, ((cast<f32>(sums[row]) * activation.quantum) * inverse_rms) * scales[row]);
+    }
+    let restored_view = restored.as_mut_slice();
+    if linear.output_signs.len() == linear.physical_rows {
+        let signs = linear.output_signs.as_slice();
+        var block_start: i64 = 0;
+        while block_start < linear.physical_rows {
+            unnormalized_hadamard_in_place(&var restored_view, block_start);
+            for 0..512 |offset| {
+                let index = block_start + offset;
+                restored_view[index] = (restored_view[index] * inverse_sqrt_hadamard_width()) * cast<f32>(signs[index]);
+            }
+            block_start = block_start + 512;
+        }
+    }
+    var output = array::new<f32>(allocator);
+    errdefer output.deinit(allocator);
+    try output.reserve(allocator, linear.rows);
+    for 0..linear.rows |row| {
+        try output.append(allocator, restored_view[row]);
+    }
+    return move output;
+}
+
+pub fn project(allocator: Allocator, projector: &var Projector, linear: &CompressedLinear, activation: &QuantizedActivation, inverse_rms: f32) -> ProjectionError!array::Array<f32> {
+    var sums = try zero_sums(allocator, linear, activation);
+    defer sums.deinit(allocator);
+    var sum_view = sums.as_mut_slice();
+    match projector.sums {
+        Gpu(gpu_sums) => {
+            try require_gpu_support(linear);
+            let gpu = gpu_sums.borrow();
+            let pass = try gpu.begin_shared_activation_pass(activation);
+            gpu.encode_row_sums(&pass, 0, linear);
+            try pass.finish();
+            try gpu.check_status();
+            gpu.copy_row_sums(0, linear, &var sum_view);
+        },
+        Threads => try sum_rows_on_threads(projector, linear, activation, &var sum_view),
+    }
+    let finished_sums = sums.as_slice();
+    return try restore_rows(allocator, linear, activation, inverse_rms, finished_sums);
+}
+
+pub struct ProjectedPair {
+    pub first: array::Array<f32>,
+    pub second: array::Array<f32>,
+}
+
+pub fn project_pair(allocator: Allocator, projector: &var Projector, first: &CompressedLinear, second: &CompressedLinear, activation: &QuantizedActivation, inverse_rms: f32) -> ProjectionError!ProjectedPair {
+    var first_sums = try zero_sums(allocator, first, activation);
+    defer first_sums.deinit(allocator);
+    var second_sums = try zero_sums(allocator, second, activation);
+    defer second_sums.deinit(allocator);
+    var first_view = first_sums.as_mut_slice();
+    var second_view = second_sums.as_mut_slice();
+    match projector.sums {
+        Gpu(gpu_sums) => {
+            try require_gpu_support(first);
+            try require_gpu_support(second);
+            let gpu = gpu_sums.borrow();
+            let pass = try gpu.begin_shared_activation_pass(activation);
+            gpu.encode_row_sums(&pass, 0, first);
+            gpu.encode_row_sums(&pass, 1, second);
+            try pass.finish();
+            try gpu.check_status();
+            gpu.copy_row_sums(0, first, &var first_view);
+            gpu.copy_row_sums(1, second, &var second_view);
+        },
+        Threads => {
+            try sum_rows_on_threads(projector, first, activation, &var first_view);
+            try sum_rows_on_threads(projector, second, activation, &var second_view);
+        },
+    }
+    let first_finished = first_sums.as_slice();
+    let second_finished = second_sums.as_slice();
+    var first_rows = try restore_rows(allocator, first, activation, inverse_rms, first_finished);
+    errdefer first_rows.deinit(allocator);
+    let second_rows = try restore_rows(allocator, second, activation, inverse_rms, second_finished);
+    return ProjectedPair { first: move first_rows, second: move second_rows };
+}
+
+pub struct ProjectedTriple {
+    pub first: array::Array<f32>,
+    pub second: array::Array<f32>,
+    pub third: array::Array<f32>,
+}
+
+pub fn project_triple(allocator: Allocator, projector: &var Projector, first: &CompressedLinear, second: &CompressedLinear, third: &CompressedLinear, activation: &QuantizedActivation, inverse_rms: f32) -> ProjectionError!ProjectedTriple {
+    var first_sums = try zero_sums(allocator, first, activation);
+    defer first_sums.deinit(allocator);
+    var second_sums = try zero_sums(allocator, second, activation);
+    defer second_sums.deinit(allocator);
+    var third_sums = try zero_sums(allocator, third, activation);
+    defer third_sums.deinit(allocator);
+    var first_view = first_sums.as_mut_slice();
+    var second_view = second_sums.as_mut_slice();
+    var third_view = third_sums.as_mut_slice();
+    match projector.sums {
+        Gpu(gpu_sums) => {
+            try require_gpu_support(first);
+            try require_gpu_support(second);
+            try require_gpu_support(third);
+            let gpu = gpu_sums.borrow();
+            let pass = try gpu.begin_shared_activation_pass(activation);
+            gpu.encode_row_sums(&pass, 0, first);
+            gpu.encode_row_sums(&pass, 1, second);
+            gpu.encode_row_sums(&pass, 2, third);
+            try pass.finish();
+            try gpu.check_status();
+            gpu.copy_row_sums(0, first, &var first_view);
+            gpu.copy_row_sums(1, second, &var second_view);
+            gpu.copy_row_sums(2, third, &var third_view);
+        },
+        Threads => {
+            try sum_rows_on_threads(projector, first, activation, &var first_view);
+            try sum_rows_on_threads(projector, second, activation, &var second_view);
+            try sum_rows_on_threads(projector, third, activation, &var third_view);
+        },
+    }
+    let first_finished = first_sums.as_slice();
+    let second_finished = second_sums.as_slice();
+    let third_finished = third_sums.as_slice();
+    var first_rows = try restore_rows(allocator, first, activation, inverse_rms, first_finished);
+    errdefer first_rows.deinit(allocator);
+    var second_rows = try restore_rows(allocator, second, activation, inverse_rms, second_finished);
+    errdefer second_rows.deinit(allocator);
+    let third_rows = try restore_rows(allocator, third, activation, inverse_rms, third_finished);
+    return ProjectedTriple { first: move first_rows, second: move second_rows, third: move third_rows };
+}

@@ -1,0 +1,46 @@
+import std::mem;
+
+pub enum SignRule {
+    SplitMix64,
+    Mulberry32,
+}
+
+pub fn stream_sign(rule: SignRule, seed: u64, position: u64) -> i8 {
+    let counter = position + 1;
+    let positive = match rule {
+        SplitMix64 => splitmix64_sign_is_positive(seed, counter),
+        Mulberry32 => mulberry32_sign_is_positive(seed, counter),
+    };
+    if positive {
+        return 1;
+    }
+    return -1;
+}
+
+fn splitmix64_sign_is_positive(seed: u64, counter: u64) -> bool {
+    var z = seed + counter * ((cast<u64>(0x9e3779b9) << 32) | 0x7f4a7c15);
+    z = (z ^ (z >> 30)) * ((cast<u64>(0xbf58476d) << 32) | 0x1ce4e5b9);
+    z = (z ^ (z >> 27)) * ((cast<u64>(0x94d049bb) << 32) | 0x133111eb);
+    z = z ^ (z >> 31);
+    return (z >> 63) == 1;
+}
+
+fn mulberry32_sign_is_positive(seed: u64, counter: u64) -> bool {
+    var initial = cast<u32>(seed & 0xffffffff) * 7919 + 13;
+    if initial == 0 {
+        initial = 0x9e3779b9;
+    }
+    var t = initial + cast<u32>(counter & 0xffffffff) * 0x6d2b79f5;
+    t = (t ^ (t >> 15)) * (t | 1);
+    t = t ^ (t + (t ^ (t >> 7)) * (t | 61));
+    t = t ^ (t >> 14);
+    return t >= 0x80000000;
+}
+
+pub fn fill_stream_signs(rule: SignRule, seed: u64, first_position: u64, signs: &var []i8) -> void {
+    let count = mem::count<i8>(signs.*);
+    for 0..count |index| {
+        signs[index] = stream_sign(rule, seed, first_position + cast<u64>(index));
+    }
+    return;
+}

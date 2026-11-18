@@ -1,0 +1,26 @@
+import kizukani::bandwidth;
+import kizukani::metal;
+import kizukani::trellis;
+
+fn print_matvec_speed(gpu: &metal::Gpu, physical_rows: i64, cols: i64, simdgroups_per_row_group: i64) -> !void {
+    let run = try trellis::run_random_matvec(gpu, physical_rows, cols, simdgroups_per_row_group, 300, 0);
+    let code_bytes = cast<f64>(trellis::code_stream_bytes(physical_rows, cols));
+    print(physical_rows);
+    print(cols);
+    print(simdgroups_per_row_group);
+    print(run.best_gpu_seconds * 1.0e6);
+    print(code_bytes / run.best_gpu_seconds / 1.0e9);
+    return;
+}
+
+pub fn run_gpu_benchmark() -> !void {
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let one_gibibyte: u64 = 1073741824;
+    print(try bandwidth::measure_read_gigabytes_per_second(&gpu, one_gibibyte, 10));
+    try print_matvec_speed(&gpu, 17408, 5120, 4);
+    try print_matvec_speed(&gpu, 17408, 5120, 8);
+    try print_matvec_speed(&gpu, 5120, 17408, 4);
+    try print_matvec_speed(&gpu, 5120, 17408, 8);
+    return;
+}

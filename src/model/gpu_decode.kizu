@@ -1,0 +1,1247 @@
+import kizukani::metal;
+import kizukani::yskn;
+import std::array;
+import std::fs;
+import std::io;
+import std::math;
+import std::mem;
+import std::string;
+
+extern "c" fn memcpy(target: ptr<u8>, source: ptr<const u8>, count: usize) -> ptr<u8>
+
+pub fn decode_maximum_positions() -> i64 {
+    return 4096;
+}
+
+pub fn chat_maximum_positions() -> i64 {
+    return 32768;
+}
+
+fn projection_slot_values() -> i64 {
+    return 262144;
+}
+
+pub fn capture_layer_count() -> i64 {
+    return 5;
+}
+
+fn capture_slot(layer: i64) -> ?i64 {
+    let taps = [5]i64{ 5, 19, 33, 47, 61 };
+    let tap_view = taps.as_slice();
+    for 0..5 |slot| {
+        if tap_view[slot] == layer {
+            return slot;
+        }
+    }
+    return null;
+}
+
+pub fn decode_batch_capacity() -> i64 {
+    return 8;
+}
+
+fn decode_state_slots() -> i64 {
+    return 9;
+}
+
+fn batch_activation_stride() -> i64 {
+    return 32768;
+}
+
+fn workspace_alignment() -> u64 {
+    return 256;
+}
+
+fn delta_state_floats() -> i64 {
+    return delta_net_value_heads() * delta_net_head_width() * delta_net_head_width();
+}
+
+fn recurrence_log_floats() -> i64 {
+    return 2 * decode_batch_capacity() * 8256;
+}
+
+fn delta_history_floats() -> i64 {
+    return delta_net_history_rows() * delta_net_channels();
+}
+
+fn attention_key_value_width() -> i64 {
+    return attention_key_value_heads() * attention_head_width();
+}
+
+pub struct GpuLinearRecord {
+    code_offset: u64,
+    table_offset: u64,
+    scale_offset: u64,
+    output_sign_offset: u64,
+    input_sign_offset: u64,
+    rotated: bool,
+    rows: i64,
+    cols: i64,
+    physical_rows: i64,
+    bits_per_step: i64,
+}
+
+pub struct GpuAttentionRecord {
+    query_and_gate: GpuLinearRecord,
+    key: GpuLinearRecord,
+    value: GpuLinearRecord,
+    output: GpuLinearRecord,
+    query_norm: u64,
+    key_norm: u64,
+}
+
+pub struct GpuDeltaNetRecord {
+    query_key_value: GpuLinearRecord,
+    output_gate: GpuLinearRecord,
+    output: GpuLinearRecord,
+    decay_gate_rows: u64,
+    update_gate_rows: u64,
+    convolution: u64,
+    log_decay: u64,
+    time_bias: u64,
+    output_norm: u64,
+}
+
+pub struct GpuFeedForwardRecord {
+    input_norm: u64,
+    post_mixer_norm: u64,
+    gate: GpuLinearRecord,
+    up: GpuLinearRecord,
+    down: GpuLinearRecord,
+}
+
+pub struct WorkspaceLayout {
+    hidden: u64,
+    activation: u64,
+    block_weights: u64,
+    scalars: u64,
+    block_scales: u64,
+    weighted_bf16: u64,
+    activation_halves: u64,
+    batch_block_weights: u64,
+    row_sums: u64,
+    projected: u64,
+    mixed: u64,
+    queries: u64,
+    key_cache: u64,
+    value_cache: u64,
+    scores: u64,
+    weight_sums: u64,
+    rotary: u64,
+    convolved: u64,
+    delta_queries: u64,
+    delta_keys: u64,
+    gates: u64,
+    core: u64,
+    recurrent: u64,
+    recurrence_log: u64,
+    history: u64,
+    capture: u64,
+    total: u64,
+    maximum_positions: i64,
+}
+
+fn aligned(offset: u64) -> u64 {
+    return (offset + workspace_alignment() - 1) / workspace_alignment() * workspace_alignment();
+}
+
+struct LayoutCursor {
+    next: u64,
+}
+
+fn (self: &var LayoutCursor) take(byte_count: i64) -> u64 {
+    let offset = aligned(self.next);
+    self.next = offset + cast<u64>(byte_count);
+    return offset;
+}
+
+pub fn workspace_layout(attention_layer_count: i64, delta_net_layer_count: i64, maximum_positions: i64) -> WorkspaceLayout {
+    var cursor = LayoutCursor { next: 0 };
+    let batch = decode_batch_capacity();
+    let hidden = cursor.take(4 * 5120 * batch);
+    let activation = cursor.take(batch_activation_stride() * batch);
+    let block_weights = cursor.take(8 * 64 * batch);
+    let scalars = cursor.take(16 * batch);
+    let block_scales = cursor.take(4 * 64 * batch);
+    let weighted_bf16 = cursor.take(4 * 5120 * batch);
+    let activation_halves = cursor.take(4 * batch_activation_stride() * batch);
+    let batch_block_weights = cursor.take(8 * 64 * batch);
+    let row_sums = cursor.take(8 * projection_slot_values() * linear_slot_count() * batch);
+    let projected = cursor.take(4 * projection_slot_values() * linear_slot_count() * batch);
+    let mixed = cursor.take(4 * batch_activation_stride() * batch);
+    let queries = cursor.take(4 * attention_query_heads() * attention_head_width() * batch);
+    let weight_sums = cursor.take(4 * attention_query_heads() * batch);
+    let rotary = cursor.take(4 * 2 * rotary_pairs() * batch);
+    let convolved = cursor.take(4 * delta_net_channels() * batch);
+    let delta_queries = cursor.take(4 * delta_net_key_heads() * delta_net_head_width() * batch);
+    let delta_keys = cursor.take(4 * delta_net_key_heads() * delta_net_head_width() * batch);
+    let gates = cursor.take(4 * 2 * delta_net_value_heads() * batch);
+    let core = cursor.take(4 * delta_net_value_heads() * delta_net_head_width() * batch);
+    let recurrent = cursor.take(4 * delta_net_layer_count * delta_state_floats());
+    let recurrence_log = cursor.take(4 * delta_net_layer_count * recurrence_log_floats());
+    let history = cursor.take(4 * delta_net_layer_count * decode_state_slots() * delta_history_floats());
+    let capture = cursor.take(4 * capture_layer_count() * 5120 * batch);
+    let cache_floats = attention_layer_count * maximum_positions * attention_key_value_width();
+    let key_cache = cursor.take(4 * cache_floats);
+    let value_cache = cursor.take(4 * cache_floats);
+    let scores = cursor.take(4 * attention_query_heads() * maximum_positions * batch);
+    return WorkspaceLayout {
+        hidden: hidden,
+        activation: activation,
+        block_weights: block_weights,
+        scalars: scalars,
+        block_scales: block_scales,
+        weighted_bf16: weighted_bf16,
+        activation_halves: activation_halves,
+        batch_block_weights: batch_block_weights,
+        row_sums: row_sums,
+        projected: projected,
+        mixed: mixed,
+        queries: queries,
+        key_cache: key_cache,
+        value_cache: value_cache,
+        scores: scores,
+        weight_sums: weight_sums,
+        rotary: rotary,
+        convolved: convolved,
+        delta_queries: delta_queries,
+        delta_keys: delta_keys,
+        gates: gates,
+        core: core,
+        recurrent: recurrent,
+        recurrence_log: recurrence_log,
+        history: history,
+        capture: capture,
+        total: aligned(cursor.next),
+        maximum_positions: maximum_positions,
+    };
+}
+
+struct ConstantsBuilder {
+    bytes: string::String,
+}
+
+fn (self: &var ConstantsBuilder) align(allocator: Allocator) -> mem::Error!u64 {
+    while cast<u64>(self.bytes.len()) % workspace_alignment() != 0 {
+        try self.bytes.append_byte(allocator, 0);
+    }
+    return cast<u64>(self.bytes.len());
+}
+
+fn (self: &var ConstantsBuilder) put_floats(allocator: Allocator, values: []f32) -> mem::Error!u64 {
+    let offset = try self.align(allocator);
+    for 0..mem::count<f32>(values) |index| {
+        let bits = yskn::binary32_bits(values[index]);
+        try self.bytes.append_byte(allocator, cast<u8>(bits & 0xff));
+        try self.bytes.append_byte(allocator, cast<u8>((bits >> 8) & 0xff));
+        try self.bytes.append_byte(allocator, cast<u8>((bits >> 16) & 0xff));
+        try self.bytes.append_byte(allocator, cast<u8>(bits >> 24));
+    }
+    return offset;
+}
+
+fn (self: &var ConstantsBuilder) put_signed_bytes(allocator: Allocator, values: []i8) -> mem::Error!u64 {
+    let offset = try self.align(allocator);
+    for 0..mem::count<i8>(values) |index| {
+        try self.bytes.append_byte(allocator, cast<u8>(values[index]));
+    }
+    return offset;
+}
+
+fn (self: &var ConstantsBuilder) put_linear(allocator: Allocator, linear: &CompressedLinear, file_address: u64) -> ProjectionError!GpuLinearRecord {
+    if !supports_linear(linear) {
+        return ModelError::UnsupportedModel;
+    }
+    let table = linear.weight_table.as_slice();
+    let table_offset = try self.put_signed_bytes(allocator, table);
+    let scales = linear.effective_row_scales.as_slice();
+    let scale_offset = try self.put_floats(allocator, scales);
+    let output_signs = linear.output_signs.as_slice();
+    let output_sign_offset = try self.put_signed_bytes(allocator, output_signs);
+    let input_signs = linear.input_signs.as_slice();
+    let input_sign_offset = try self.put_signed_bytes(allocator, input_signs);
+    return GpuLinearRecord {
+        code_offset: linear.code_address - file_address,
+        table_offset: table_offset,
+        scale_offset: scale_offset,
+        output_sign_offset: output_sign_offset,
+        input_sign_offset: input_sign_offset,
+        rotated: linear.output_signs.len() == linear.physical_rows,
+        rows: linear.rows,
+        cols: linear.cols,
+        physical_rows: linear.physical_rows,
+        bits_per_step: linear.bits_per_step,
+    };
+}
+
+fn (self: &var ConstantsBuilder) put_vector(allocator: Allocator, values: &array::Array<f32>) -> mem::Error!u64 {
+    let view = values.as_slice();
+    return try self.put_floats(allocator, view);
+}
+
+pub struct DecoderRecords {
+    attention: array::Array<GpuAttentionRecord>,
+    delta_net: array::Array<GpuDeltaNetRecord>,
+    feed_forward: array::Array<GpuFeedForwardRecord>,
+    final_norm: u64,
+    output_head: GpuLinearRecord,
+}
+
+fn build_constants(allocator: Allocator, builder: &var ConstantsBuilder, weights: &ModelWeights, file_address: u64) -> ProjectionError!DecoderRecords {
+    var attention = array::new<GpuAttentionRecord>(allocator);
+    errdefer attention.deinit(allocator);
+    for 0..weights.attention_layers.len() |index| {
+        if weights.attention_layers.at(index) |layer| {
+            try attention.append(allocator, GpuAttentionRecord {
+                query_and_gate: try builder.put_linear(allocator, &layer.query_and_gate, file_address),
+                key: try builder.put_linear(allocator, &layer.key, file_address),
+                value: try builder.put_linear(allocator, &layer.value, file_address),
+                output: try builder.put_linear(allocator, &layer.output, file_address),
+                query_norm: try builder.put_vector(allocator, &layer.query_norm),
+                key_norm: try builder.put_vector(allocator, &layer.key_norm),
+            });
+        }
+    }
+    var delta_net = array::new<GpuDeltaNetRecord>(allocator);
+    errdefer delta_net.deinit(allocator);
+    for 0..weights.delta_net_layers.len() |index| {
+        if weights.delta_net_layers.at(index) |layer| {
+            try delta_net.append(allocator, GpuDeltaNetRecord {
+                query_key_value: try builder.put_linear(allocator, &layer.query_key_value, file_address),
+                output_gate: try builder.put_linear(allocator, &layer.output_gate, file_address),
+                output: try builder.put_linear(allocator, &layer.output, file_address),
+                decay_gate_rows: try builder.put_vector(allocator, &layer.decay_gate_rows),
+                update_gate_rows: try builder.put_vector(allocator, &layer.update_gate_rows),
+                convolution: try builder.put_vector(allocator, &layer.convolution),
+                log_decay: try builder.put_vector(allocator, &layer.log_decay),
+                time_bias: try builder.put_vector(allocator, &layer.time_bias),
+                output_norm: try builder.put_vector(allocator, &layer.output_norm),
+            });
+        }
+    }
+    var feed_forward = array::new<GpuFeedForwardRecord>(allocator);
+    errdefer feed_forward.deinit(allocator);
+    for 0..weights.feed_forward_layers.len() |index| {
+        if weights.feed_forward_layers.at(index) |layer| {
+            try feed_forward.append(allocator, GpuFeedForwardRecord {
+                input_norm: try builder.put_vector(allocator, &layer.input_norm),
+                post_mixer_norm: try builder.put_vector(allocator, &layer.post_mixer_norm),
+                gate: try builder.put_linear(allocator, &layer.gate, file_address),
+                up: try builder.put_linear(allocator, &layer.up, file_address),
+                down: try builder.put_linear(allocator, &layer.down, file_address),
+            });
+        }
+    }
+    let final_norm = try builder.put_vector(allocator, &weights.final_norm);
+    let output_head = try builder.put_linear(allocator, &weights.output_head, file_address);
+    return DecoderRecords {
+        attention: move attention,
+        delta_net: move delta_net,
+        feed_forward: move feed_forward,
+        final_norm: final_norm,
+        output_head: output_head,
+    };
+}
+
+/// Every Metal object is retained; file_bytes wraps the model mapping, which the creator keeps until deinit.
+pub unsafe struct GpuDecoder {
+    gpu: metal::Gpu,
+    six_bit_sums: metal::Kernel,
+    eight_bit_sums: metal::Kernel,
+    six_bit_batch_sums: metal::Kernel,
+    eight_bit_batch_sums: metal::Kernel,
+    prepare: metal::Kernel,
+    finish_activation: metal::Kernel,
+    restore: metal::Kernel,
+    attention_keys: metal::Kernel,
+    attention_queries: metal::Kernel,
+    attention_scores: metal::Kernel,
+    attention_weights: metal::Kernel,
+    attention_output: metal::Kernel,
+    delta_convolution: metal::Kernel,
+    delta_query_key: metal::Kernel,
+    delta_gates: metal::Kernel,
+    delta_recurrence: metal::Kernel,
+    delta_output: metal::Kernel,
+    gated_product: metal::Kernel,
+    add_residual: metal::Kernel,
+    copy_rows: metal::Kernel,
+    file_bytes: metal::Buffer,
+    constants: metal::Buffer,
+    workspace: metal::Buffer,
+    status: metal::Buffer,
+    file_byte_count: u64,
+    constant_byte_count: u64,
+    layout: WorkspaceLayout,
+    records: DecoderRecords,
+}
+
+enum Store {
+    File,
+    Constants,
+    Workspace,
+}
+
+pub fn generated_kernel_path() -> []u8 {
+    return "target/kernels.metal";
+}
+
+fn copy_into_buffer<B>(buffer: &B, bytes: []u8) -> void {
+    let cells = buffer.contents();
+    // SAFETY: the caller sized buffer for bytes, and no GPU work uses it yet.
+    let view = unsafe mut_view_from_ptr(cells, mem::len(bytes));
+    for 0..mem::len(bytes) |index| {
+        view[index] = bytes[index];
+    }
+    return;
+}
+
+fn zero_workspace_range<B>(workspace: &B, offset: u64, byte_count: i64) -> void {
+    // SAFETY: reading an address as an integer touches no memory.
+    let first = unsafe int_from_ptr<usize>(workspace.contents()) + cast<usize>(offset);
+    // SAFETY: offset + byte_count lies inside the workspace, and no GPU work uses it yet.
+    let cells = unsafe ptr_from_int<ptr<u8>>(first);
+    // SAFETY: as above.
+    let view = unsafe mut_view_from_ptr(cells, byte_count);
+    for 0..byte_count |index| {
+        view[index] = 0;
+    }
+    return;
+}
+
+/// file_address is the page-aligned start of a mapping of file_byte_count bytes that outlives the result.
+pub unsafe fn open_gpu_decoder(allocator: Allocator, weights: &ModelWeights, file_address: u64, file_byte_count: u64, maximum_positions: i64) -> ProjectionError!GpuDecoder {
+    var builder = ConstantsBuilder { bytes: string::new(allocator) };
+    defer builder.deinit(allocator);
+    var records = try build_constants(allocator, &var builder, weights, file_address);
+    errdefer records.deinit(allocator);
+    let path = generated_kernel_path();
+    let kernel_source = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer kernel_source.deinit(allocator);
+
+    let gpu = try metal::open_default_gpu();
+    errdefer gpu.release();
+    let wrapped_byte_count = rounded_up_to_page(file_byte_count);
+    if wrapped_byte_count > gpu.max_buffer_length() {
+        return ModelError::UnsupportedModel;
+    }
+    let source_bytes = kernel_source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let six_bit_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_six");
+    errdefer six_bit_sums.release();
+    let eight_bit_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_eight");
+    errdefer eight_bit_sums.release();
+    let six_bit_batch_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_six_batch");
+    errdefer six_bit_batch_sums.release();
+    let eight_bit_batch_sums = try library.kernel(&gpu, c"compressed_linear_row_sums_eight_batch");
+    errdefer eight_bit_batch_sums.release();
+    let prepare = try library.kernel(&gpu, c"prepare_activation");
+    errdefer prepare.release();
+    let finish_activation = try library.kernel(&gpu, c"finish_activation");
+    errdefer finish_activation.release();
+    let restore = try library.kernel(&gpu, c"restore_rows");
+    errdefer restore.release();
+    let attention_keys = try library.kernel(&gpu, c"attention_keys");
+    errdefer attention_keys.release();
+    let attention_queries = try library.kernel(&gpu, c"attention_queries");
+    errdefer attention_queries.release();
+    let attention_scores = try library.kernel(&gpu, c"attention_scores");
+    errdefer attention_scores.release();
+    let attention_weights = try library.kernel(&gpu, c"attention_weights");
+    errdefer attention_weights.release();
+    let attention_output = try library.kernel(&gpu, c"attention_output");
+    errdefer attention_output.release();
+    let delta_convolution = try library.kernel(&gpu, c"delta_convolution");
+    errdefer delta_convolution.release();
+    let delta_query_key = try library.kernel(&gpu, c"delta_query_key");
+    errdefer delta_query_key.release();
+    let delta_gates = try library.kernel(&gpu, c"delta_gates");
+    errdefer delta_gates.release();
+    let delta_recurrence = try library.kernel(&gpu, c"delta_recurrence");
+    errdefer delta_recurrence.release();
+    let delta_output = try library.kernel(&gpu, c"delta_output");
+    errdefer delta_output.release();
+    let gated_product = try library.kernel(&gpu, c"gated_product");
+    errdefer gated_product.release();
+    let add_residual = try library.kernel(&gpu, c"add_residual");
+    errdefer add_residual.release();
+    let copy_rows = try library.kernel(&gpu, c"copy_rows");
+    errdefer copy_rows.release();
+    // SAFETY: file_address starts a page-aligned mapping whose last page is readable to its end, kept by the caller.
+    let file_bytes = try unsafe gpu.wrap_shared_bytes(unsafe ptr_from_int<ptr<u8>>(cast<usize>(file_address)), wrapped_byte_count);
+    errdefer file_bytes.release();
+    let constant_bytes = builder.bytes.as_bytes();
+    let constant_byte_count = cast<u64>(mem::len(constant_bytes));
+    let constants = try gpu.new_shared_buffer(constant_byte_count);
+    errdefer constants.release();
+    copy_into_buffer<metal::Buffer>(&constants, constant_bytes);
+    let layout = workspace_layout(weights.attention_layers.len(), weights.delta_net_layers.len(), maximum_positions);
+    if layout.total > gpu.max_buffer_length() {
+        return ModelError::UnsupportedModel;
+    }
+    let workspace = try gpu.new_shared_buffer(layout.total);
+    errdefer workspace.release();
+    zero_workspace_range<metal::Buffer>(&workspace, layout.recurrent, cast<i64>(layout.key_cache - layout.recurrent));
+    let status = try gpu.new_shared_buffer(16);
+    zero_workspace_range<metal::Buffer>(&status, 0, 16);
+    // SAFETY: every Metal object is retained above, and the caller keeps the mapping, as the struct promises.
+    return unsafe GpuDecoder {
+        gpu: move gpu,
+        six_bit_sums: move six_bit_sums,
+        eight_bit_sums: move eight_bit_sums,
+        six_bit_batch_sums: move six_bit_batch_sums,
+        eight_bit_batch_sums: move eight_bit_batch_sums,
+        prepare: move prepare,
+        finish_activation: move finish_activation,
+        restore: move restore,
+        attention_keys: move attention_keys,
+        attention_queries: move attention_queries,
+        attention_scores: move attention_scores,
+        attention_weights: move attention_weights,
+        attention_output: move attention_output,
+        delta_convolution: move delta_convolution,
+        delta_query_key: move delta_query_key,
+        delta_gates: move delta_gates,
+        delta_recurrence: move delta_recurrence,
+        delta_output: move delta_output,
+        gated_product: move gated_product,
+        add_residual: move add_residual,
+        copy_rows: move copy_rows,
+        file_bytes: move file_bytes,
+        constants: move constants,
+        workspace: move workspace,
+        status: move status,
+        file_byte_count: wrapped_byte_count,
+        constant_byte_count: constant_byte_count,
+        layout: layout,
+        records: move records,
+    };
+}
+
+pub fn (self: &GpuDecoder) maximum_positions() -> i64 {
+    return self.layout.maximum_positions;
+}
+
+fn copy_workspace_bytes(target: &metal::Buffer, target_offset: u64, source: &metal::Buffer, source_offset: u64, byte_count: i64) -> void {
+    // SAFETY: reading addresses as integers touches no memory.
+    let target_first = unsafe int_from_ptr<usize>(target.contents()) + cast<usize>(target_offset);
+    // SAFETY: as above.
+    let source_first = unsafe int_from_ptr<usize>(source.contents()) + cast<usize>(source_offset);
+    // SAFETY: the caller keeps both ranges inside their buffers, they do not overlap, and no GPU work is in flight.
+    unsafe memcpy(unsafe ptr_from_int<ptr<u8>>(target_first), unsafe ptr_from_int<ptr<const u8>>(source_first), cast<usize>(byte_count));
+    return;
+}
+
+/// Moves the decoder to a larger workspace, keeping the state and the first used_positions cache rows.
+pub fn (self: &var GpuDecoder) grow_positions(weights: &ModelWeights, maximum_positions: i64, used_positions: i64) -> !void {
+    if maximum_positions <= self.layout.maximum_positions {
+        return;
+    }
+    if used_positions < 0 or used_positions > self.layout.maximum_positions {
+        return ModelError::ShapeMismatch;
+    }
+    let layers = weights.attention_layers.len();
+    let layout = workspace_layout(layers, weights.delta_net_layers.len(), maximum_positions);
+    if layout.total > self.gpu.max_buffer_length() {
+        return ModelError::UnsupportedModel;
+    }
+    let workspace = try self.gpu.new_shared_buffer(layout.total);
+    copy_workspace_bytes(&workspace, 0, &self.workspace, 0, cast<i64>(self.layout.key_cache));
+    let row_bytes = 4 * attention_key_value_width();
+    for 0..layers |layer| {
+        let old_first = cast<u64>(layer * self.layout.maximum_positions * row_bytes);
+        let new_first = cast<u64>(layer * maximum_positions * row_bytes);
+        copy_workspace_bytes(&workspace, layout.key_cache + new_first, &self.workspace, self.layout.key_cache + old_first, used_positions * row_bytes);
+        copy_workspace_bytes(&workspace, layout.value_cache + new_first, &self.workspace, self.layout.value_cache + old_first, used_positions * row_bytes);
+    }
+    // SAFETY: the new workspace holds the layout stored next, and no GPU work is in flight.
+    unsafe self.workspace.replace_with(move workspace);
+    // SAFETY: as above.
+    unsafe self.layout = layout;
+    return;
+}
+
+pub fn (self: GpuDecoder) deinit(allocator: Allocator) -> void {
+    self.records.deinit(allocator);
+    self.status.release();
+    self.workspace.release();
+    self.constants.release();
+    self.file_bytes.release();
+    self.copy_rows.release();
+    self.add_residual.release();
+    self.gated_product.release();
+    self.delta_output.release();
+    self.delta_recurrence.release();
+    self.delta_gates.release();
+    self.delta_query_key.release();
+    self.delta_convolution.release();
+    self.attention_output.release();
+    self.attention_weights.release();
+    self.attention_scores.release();
+    self.attention_keys.release();
+    self.attention_queries.release();
+    self.restore.release();
+    self.finish_activation.release();
+    self.prepare.release();
+    self.eight_bit_batch_sums.release();
+    self.six_bit_batch_sums.release();
+    self.eight_bit_sums.release();
+    self.six_bit_sums.release();
+    self.gpu.release();
+    return;
+}
+
+fn bind_i64<P>(pass: &P, index: u64, value: i64) -> void {
+    let words = [1]i64{ value };
+    let word_view = words.as_slice();
+    // SAFETY: the word is eight readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(word_view));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, 8);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn bind_u32<P>(pass: &P, index: u64, value: u32) -> void {
+    let words = [1]u32{ value };
+    let word_view = words.as_slice();
+    // SAFETY: the word is four readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(word_view));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, 4);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn bind_lengths<P>(pass: &P, index: u64, lengths: []i64) -> void {
+    // SAFETY: the lengths are 8 * count readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(lengths));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, mem::count<i64>(lengths) * 8);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn threadgroups_for(thread_count: i64, width: i64) -> u64 {
+    return cast<u64>((thread_count + width - 1) / width);
+}
+
+fn projected_slot<D>(self: &D, slot: i64) -> u64 {
+    return self.layout.projected + cast<u64>(4 * slot * decode_batch_capacity() * projection_slot_values());
+}
+
+fn row_sum_slot<D>(self: &D, slot: i64) -> u64 {
+    return self.layout.row_sums + cast<u64>(8 * slot * decode_batch_capacity() * projection_slot_values());
+}
+
+fn view<D, P>(self: &D, pass: &P, index: u64, store: Store, offset: u64, element_bytes: i64) -> i64 {
+    var total = self.layout.total;
+    if store == Store::File {
+        pass.bind_buffer_from(index, &self.file_bytes, offset);
+        total = self.file_byte_count;
+    }
+    if store == Store::Constants {
+        pass.bind_buffer_from(index, &self.constants, offset);
+        total = self.constant_byte_count;
+    }
+    if store == Store::Workspace {
+        pass.bind_buffer_from(index, &self.workspace, offset);
+    }
+    return cast<i64>(total - offset) / element_bytes;
+}
+
+fn finish_kernel<D, P>(self: &D, pass: &P, index: u64, lengths: []i64) -> void {
+    bind_lengths<P>(pass, index, lengths);
+    pass.bind_buffer(index + 1, &self.status);
+    return;
+}
+
+fn encode_prepare<D, P>(self: &D, pass: &P, input: u64, input_stride: i64, norm_weight: u64, signs: u64, width: i64, normalized: bool, count: i64) -> void {
+    let lengths = [8]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, input, 4),
+        view<D, P>(self, pass, 1, Store::Constants, norm_weight, 4),
+        view<D, P>(self, pass, 2, Store::Constants, signs, 1),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.activation, 1),
+        view<D, P>(self, pass, 4, Store::Workspace, self.layout.scalars, 4),
+        view<D, P>(self, pass, 5, Store::Workspace, self.layout.weighted_bf16, 4),
+        view<D, P>(self, pass, 6, Store::Workspace, self.layout.activation_halves, 2),
+        view<D, P>(self, pass, 7, Store::Workspace, self.layout.block_scales, 4)
+    };
+    var normalized_word: u32 = 0;
+    if normalized {
+        normalized_word = 1;
+    }
+    bind_i64<P>(pass, 8, width);
+    bind_u32<P>(pass, 9, normalized_word);
+    bind_i64<P>(pass, 10, input_stride);
+    let length_view = lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 11, length_view);
+    pass.dispatch_threadgroups(&self.prepare, cast<u64>(count * (width / 512)), 512);
+    encode_activation_finish<D, P>(self, pass, width, count);
+    return;
+}
+
+fn encode_activation_finish<D, P>(self: &D, pass: &P, width: i64, count: i64) -> void {
+    let lengths = [4]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.block_scales, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, self.layout.block_weights, 8),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.batch_block_weights, 8),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.scalars, 4)
+    };
+    bind_i64<P>(pass, 4, width);
+    bind_i64<P>(pass, 5, count);
+    let length_view = lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 6, length_view);
+    pass.dispatch_threadgroups(&self.finish_activation, 1, 32);
+    return;
+}
+
+fn encode_projection<D, P>(self: &D, pass: &P, linear: &GpuLinearRecord, slot: i64, count: i64) -> void {
+    let threadgroup_width = cast<u64>(32 * linear_sums_simdgroups_per_row_group());
+    let threadgroup_count = cast<u64>(linear.physical_rows / 32);
+    if count == 1 {
+        let sum_lengths = [5]i64{
+            view<D, P>(self, pass, 0, Store::File, linear.code_offset, 4),
+            view<D, P>(self, pass, 1, Store::Constants, linear.table_offset, 2),
+            view<D, P>(self, pass, 2, Store::Workspace, self.layout.activation, 1),
+            view<D, P>(self, pass, 3, Store::Workspace, self.layout.block_weights, 8),
+            view<D, P>(self, pass, 4, Store::Workspace, row_sum_slot<D>(self, slot), 8)
+        };
+        bind_i64<P>(pass, 5, linear.physical_rows);
+        bind_i64<P>(pass, 6, linear.cols / 256);
+        let sum_length_view = sum_lengths.as_slice();
+        finish_kernel<D, P>(self, pass, 7, sum_length_view);
+        if linear.bits_per_step == 6 {
+            pass.dispatch_threadgroups(&self.six_bit_sums, threadgroup_count, threadgroup_width);
+        } else {
+            pass.dispatch_threadgroups(&self.eight_bit_sums, threadgroup_count, threadgroup_width);
+        }
+    } else {
+        let batch_lengths = [5]i64{
+            view<D, P>(self, pass, 0, Store::File, linear.code_offset, 4),
+            view<D, P>(self, pass, 1, Store::Constants, linear.table_offset, 2),
+            view<D, P>(self, pass, 2, Store::Workspace, self.layout.activation_halves, 4),
+            view<D, P>(self, pass, 3, Store::Workspace, self.layout.batch_block_weights, 8),
+            view<D, P>(self, pass, 4, Store::Workspace, row_sum_slot<D>(self, slot), 8)
+        };
+        bind_i64<P>(pass, 5, linear.physical_rows);
+        bind_i64<P>(pass, 6, linear.cols / 256);
+        bind_i64<P>(pass, 7, count);
+        bind_i64<P>(pass, 8, projection_slot_values());
+        let batch_length_view = batch_lengths.as_slice();
+        finish_kernel<D, P>(self, pass, 9, batch_length_view);
+        if linear.bits_per_step == 6 {
+            pass.dispatch_threadgroups(&self.six_bit_batch_sums, threadgroup_count, threadgroup_width);
+        } else {
+            pass.dispatch_threadgroups(&self.eight_bit_batch_sums, threadgroup_count, threadgroup_width);
+        }
+    }
+    let lengths = [5]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, row_sum_slot<D>(self, slot), 8),
+        view<D, P>(self, pass, 1, Store::Constants, linear.scale_offset, 4),
+        view<D, P>(self, pass, 2, Store::Constants, linear.output_sign_offset, 1),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.scalars, 4),
+        view<D, P>(self, pass, 4, Store::Workspace, projected_slot<D>(self, slot), 4)
+    };
+    var rotated_word: u32 = 0;
+    if linear.rotated {
+        rotated_word = 1;
+    }
+    let groups_per_token = cast<i64>(threadgroups_for(linear.physical_rows, 512));
+    bind_i64<P>(pass, 5, linear.physical_rows);
+    bind_i64<P>(pass, 6, linear.rows);
+    bind_u32<P>(pass, 7, rotated_word);
+    bind_i64<P>(pass, 8, groups_per_token);
+    let length_view = lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 9, length_view);
+    pass.dispatch_threadgroups(&self.restore, cast<u64>(groups_per_token * count), 512);
+    return;
+}
+
+fn encode_residual<D, P>(self: &D, pass: &P, count: i64) -> void {
+    let lengths = [2]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.hidden, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, projected_slot<D>(self, 0), 4)
+    };
+    bind_i64<P>(pass, 2, 5120);
+    let length_view = lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 3, length_view);
+    pass.dispatch_threadgroups(&self.add_residual, threadgroups_for(5120 * count, 256), 256);
+    return;
+}
+
+fn encode_attention<D, P>(self: &D, pass: &P, layer: &GpuAttentionRecord, input_norm: u64, cache_layer: i64, position: i64, count: i64) -> void {
+    encode_prepare<D, P>(self, pass, self.layout.hidden, 5120, input_norm, layer.query_and_gate.input_sign_offset, 5120, true, count);
+    encode_projection<D, P>(self, pass, &layer.query_and_gate, 0, count);
+    encode_projection<D, P>(self, pass, &layer.key, 1, count);
+    encode_projection<D, P>(self, pass, &layer.value, 2, count);
+    let maximum_positions = self.layout.maximum_positions;
+    let cache_first = cache_layer * maximum_positions * attention_key_value_width();
+    let key_lengths = [6]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, projected_slot<D>(self, 1), 4),
+        view<D, P>(self, pass, 1, Store::Workspace, projected_slot<D>(self, 2), 4),
+        view<D, P>(self, pass, 2, Store::Constants, layer.key_norm, 4),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.rotary, 4),
+        view<D, P>(self, pass, 4, Store::Workspace, self.layout.key_cache, 4),
+        view<D, P>(self, pass, 5, Store::Workspace, self.layout.value_cache, 4)
+    };
+    bind_i64<P>(pass, 6, position);
+    bind_i64<P>(pass, 7, cache_first);
+    let key_length_view = key_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 8, key_length_view);
+    pass.dispatch_threadgroups(&self.attention_keys, cast<u64>(attention_key_value_heads() * count), cast<u64>(attention_head_width()));
+    let query_lengths = [4]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, projected_slot<D>(self, 0), 4),
+        view<D, P>(self, pass, 1, Store::Constants, layer.query_norm, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.rotary, 4),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.queries, 4)
+    };
+    let query_length_view = query_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 4, query_length_view);
+    pass.dispatch_threadgroups(&self.attention_queries, cast<u64>(attention_query_heads() * count), cast<u64>(attention_head_width()));
+    let score_lengths = [3]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.queries, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, self.layout.key_cache, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.scores, 4)
+    };
+    bind_i64<P>(pass, 3, position);
+    bind_i64<P>(pass, 4, cache_first);
+    bind_i64<P>(pass, 5, maximum_positions);
+    bind_i64<P>(pass, 6, count);
+    let score_length_view = score_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 7, score_length_view);
+    pass.dispatch_threadgroups(&self.attention_scores, threadgroups_for(attention_query_heads() * (position + count) * count, 256), 256);
+    let weight_lengths = [2]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.scores, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, self.layout.weight_sums, 4)
+    };
+    bind_i64<P>(pass, 2, position);
+    bind_i64<P>(pass, 3, maximum_positions);
+    bind_i64<P>(pass, 4, count);
+    let weight_length_view = weight_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 5, weight_length_view);
+    pass.dispatch_threadgroups(&self.attention_weights, threadgroups_for(attention_query_heads() * count, 32), 32);
+    let output_lengths = [5]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.scores, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, self.layout.weight_sums, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.value_cache, 4),
+        view<D, P>(self, pass, 3, Store::Workspace, projected_slot<D>(self, 0), 4),
+        view<D, P>(self, pass, 4, Store::Workspace, self.layout.mixed, 4)
+    };
+    bind_i64<P>(pass, 5, position);
+    bind_i64<P>(pass, 6, cache_first);
+    bind_i64<P>(pass, 7, maximum_positions);
+    let output_length_view = output_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 8, output_length_view);
+    pass.dispatch_threadgroups(&self.attention_output, cast<u64>(attention_query_heads() * count), cast<u64>(attention_head_width()));
+    encode_prepare<D, P>(self, pass, self.layout.mixed, batch_activation_stride(), 0, layer.output.input_sign_offset, layer.output.cols, false, count);
+    encode_projection<D, P>(self, pass, &layer.output, 0, count);
+    return;
+}
+
+fn encode_delta_net<D, P>(self: &D, pass: &P, layer: &GpuDeltaNetRecord, input_norm: u64, state_layer: i64, base_slot: i64, count: i64) -> void {
+    encode_prepare<D, P>(self, pass, self.layout.hidden, 5120, input_norm, layer.query_key_value.input_sign_offset, 5120, true, count);
+    encode_projection<D, P>(self, pass, &layer.query_key_value, 0, count);
+    encode_projection<D, P>(self, pass, &layer.output_gate, 1, count);
+    let convolution_lengths = [4]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, projected_slot<D>(self, 0), 4),
+        view<D, P>(self, pass, 1, Store::Constants, layer.convolution, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.history + cast<u64>(4 * state_layer * decode_state_slots() * delta_history_floats()), 4),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.convolved, 4)
+    };
+    bind_i64<P>(pass, 4, base_slot);
+    bind_i64<P>(pass, 5, count);
+    let convolution_length_view = convolution_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 6, convolution_length_view);
+    pass.dispatch_threadgroups(&self.delta_convolution, threadgroups_for(delta_net_channels(), 256), 256);
+    let query_key_lengths = [3]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.convolved, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, self.layout.delta_queries, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.delta_keys, 4)
+    };
+    let query_key_length_view = query_key_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 3, query_key_length_view);
+    pass.dispatch_threadgroups(&self.delta_query_key, cast<u64>(delta_net_key_heads() * count), cast<u64>(delta_net_head_width()));
+    let gate_lengths = [7]i64{
+        view<D, P>(self, pass, 0, Store::Constants, layer.decay_gate_rows, 4),
+        view<D, P>(self, pass, 1, Store::Constants, layer.update_gate_rows, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.weighted_bf16, 4),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.scalars, 4),
+        view<D, P>(self, pass, 4, Store::Constants, layer.log_decay, 4),
+        view<D, P>(self, pass, 5, Store::Constants, layer.time_bias, 4),
+        view<D, P>(self, pass, 6, Store::Workspace, self.layout.gates, 4)
+    };
+    let gate_length_view = gate_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 7, gate_length_view);
+    pass.dispatch_threadgroups(&self.delta_gates, cast<u64>(count), cast<u64>(2 * delta_net_value_heads()));
+    let recurrence_lengths = [7]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.convolved, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, self.layout.delta_queries, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.delta_keys, 4),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.gates, 4),
+        view<D, P>(self, pass, 4, Store::Workspace, self.layout.recurrent + cast<u64>(4 * state_layer * delta_state_floats()), 4),
+        view<D, P>(self, pass, 5, Store::Workspace, self.layout.recurrence_log + cast<u64>(4 * state_layer * recurrence_log_floats()), 4),
+        view<D, P>(self, pass, 6, Store::Workspace, self.layout.core, 4)
+    };
+    bind_i64<P>(pass, 7, pending_tokens<D>(self));
+    bind_i64<P>(pass, 8, log_half<D>(self));
+    bind_i64<P>(pass, 9, count);
+    let recurrence_length_view = recurrence_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 10, recurrence_length_view);
+    pass.dispatch_threadgroups(&self.delta_recurrence, cast<u64>(delta_net_value_heads()), cast<u64>(4 * delta_net_head_width()));
+    let output_lengths = [4]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.core, 4),
+        view<D, P>(self, pass, 1, Store::Constants, layer.output_norm, 4),
+        view<D, P>(self, pass, 2, Store::Workspace, projected_slot<D>(self, 1), 4),
+        view<D, P>(self, pass, 3, Store::Workspace, self.layout.mixed, 4)
+    };
+    let output_length_view = output_lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 4, output_length_view);
+    pass.dispatch_threadgroups(&self.delta_output, cast<u64>(delta_net_value_heads() * count), cast<u64>(delta_net_head_width()));
+    encode_prepare<D, P>(self, pass, self.layout.mixed, batch_activation_stride(), 0, layer.output.input_sign_offset, layer.output.cols, false, count);
+    encode_projection<D, P>(self, pass, &layer.output, 0, count);
+    return;
+}
+
+fn encode_feed_forward<D, P>(self: &D, pass: &P, layer: &GpuFeedForwardRecord, count: i64) -> void {
+    encode_prepare<D, P>(self, pass, self.layout.hidden, 5120, layer.post_mixer_norm, layer.gate.input_sign_offset, 5120, true, count);
+    encode_projection<D, P>(self, pass, &layer.gate, 0, count);
+    encode_projection<D, P>(self, pass, &layer.up, 1, count);
+    let lengths = [3]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, projected_slot<D>(self, 0), 4),
+        view<D, P>(self, pass, 1, Store::Workspace, projected_slot<D>(self, 1), 4),
+        view<D, P>(self, pass, 2, Store::Workspace, self.layout.mixed, 4)
+    };
+    bind_i64<P>(pass, 3, layer.gate.rows);
+    let length_view = lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 4, length_view);
+    pass.dispatch_threadgroups(&self.gated_product, threadgroups_for(layer.gate.rows * count, 256), 256);
+    encode_prepare<D, P>(self, pass, self.layout.mixed, batch_activation_stride(), 0, layer.down.input_sign_offset, layer.down.cols, false, count);
+    encode_projection<D, P>(self, pass, &layer.down, 0, count);
+    encode_residual<D, P>(self, pass, count);
+    return;
+}
+
+fn encode_capture<D, P>(self: &D, pass: &P, slot: i64, count: i64) -> void {
+    let lengths = [2]i64{
+        view<D, P>(self, pass, 0, Store::Workspace, self.layout.hidden, 4),
+        view<D, P>(self, pass, 1, Store::Workspace, self.layout.capture + cast<u64>(4 * slot * 5120), 4)
+    };
+    bind_i64<P>(pass, 2, 5120);
+    bind_i64<P>(pass, 3, 5120);
+    bind_i64<P>(pass, 4, capture_layer_count() * 5120);
+    bind_i64<P>(pass, 5, count);
+    let length_view = lengths.as_slice();
+    finish_kernel<D, P>(self, pass, 6, length_view);
+    pass.dispatch_threadgroups(&self.copy_rows, threadgroups_for(5120 * count, 256), 256);
+    return;
+}
+
+fn workspace_address<D>(self: &D, offset: u64) -> usize {
+    // SAFETY: reading an address as an integer touches no memory.
+    return unsafe int_from_ptr<usize>(self.workspace.contents()) + cast<usize>(offset);
+}
+
+fn status_word<D>(self: &D) -> u32 {
+    // SAFETY: the status buffer holds four u32, and no GPU work is in flight.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(self.status.contents()), 4);
+    let word = words[0];
+    words[0] = 0;
+    return word;
+}
+
+fn state_base<D>(self: &D) -> i64 {
+    // SAFETY: the status buffer holds four u32, and no GPU work is in flight.
+    let words = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(self.status.contents()), 4);
+    return cast<i64>(words[1]);
+}
+
+fn advance_state_base<D>(self: &D, count: i64) -> void {
+    // SAFETY: the status buffer holds four u32, and no GPU work is in flight.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(self.status.contents()), 4);
+    words[1] = cast<u32>((cast<i64>(words[1]) + count) % decode_state_slots());
+    words[2] = cast<u32>(count);
+    return;
+}
+
+fn pending_tokens<D>(self: &D) -> i64 {
+    // SAFETY: the status buffer holds four u32, and no GPU work is in flight.
+    let words = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(self.status.contents()), 4);
+    return cast<i64>(words[2]);
+}
+
+fn log_half<D>(self: &D) -> i64 {
+    // SAFETY: the status buffer holds four u32, and no GPU work is in flight.
+    let words = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(self.status.contents()), 4);
+    return cast<i64>(words[3]);
+}
+
+fn finish_tokens<D>(self: &D) -> void {
+    // SAFETY: the status buffer holds four u32, and no GPU work is in flight.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(self.status.contents()), 4);
+    words[2] = 0;
+    words[3] = 1 - words[3];
+    return;
+}
+
+fn load_token_inputs<D>(self: &D, weights: &ModelWeights, embeddings: []f32, position: i64, count: i64) -> !void {
+    if count < 1 or count > decode_batch_capacity() or position + count > self.layout.maximum_positions or mem::count<f32>(embeddings) != count * weights.hidden_width {
+        return ModelError::ShapeMismatch;
+    }
+    let stale = status_word<D>(self);
+    if stale != 0 {
+        return ModelError::KernelFailed;
+    }
+    // SAFETY: the hidden slots hold decode_batch_capacity() rows of hidden_width floats, and no GPU work is in flight.
+    let hidden_cells = unsafe ptr_from_int<ptr<f32>>(workspace_address<D>(self, self.layout.hidden));
+    // SAFETY: as above.
+    let hidden = unsafe mut_view_from_ptr(hidden_cells, count * weights.hidden_width);
+    for 0..(count * weights.hidden_width) |index| {
+        hidden[index] = embeddings[index];
+    }
+    // SAFETY: the rotary slots hold two floats per pair for each token, and no GPU work is in flight.
+    let rotary_cells = unsafe ptr_from_int<ptr<f32>>(workspace_address<D>(self, self.layout.rotary));
+    // SAFETY: as above.
+    let rotary = unsafe mut_view_from_ptr(rotary_cells, count * 2 * rotary_pairs());
+    for 0..count |token| {
+        let first = token * 2 * rotary_pairs();
+        for 0..rotary_pairs() |pair| {
+            let angle = cast<f32>(position + token) * rope_frequency(pair);
+            rotary[first + pair] = round_to_bf16(cast<f32>(math::cos<f64>(cast<f64>(angle))));
+            rotary[first + rotary_pairs() + pair] = round_to_bf16(cast<f32>(math::sin<f64>(cast<f64>(angle))));
+        }
+    }
+    return;
+}
+
+fn encode_tokens<D, P>(self: &D, pass: &P, weights: &ModelWeights, position: i64, count: i64) -> void {
+    let base_slot = state_base<D>(self);
+    for 0..weights.layer_count |layer| {
+        let mixer_index = weights.layer_mixer_index.get_or_panic(layer);
+        if self.records.feed_forward.at(layer) |feed_forward| {
+            if weights.layer_is_attention.get_or_panic(layer) {
+                if self.records.attention.at(mixer_index) |attention| {
+                    encode_attention<D, P>(self, pass, attention, feed_forward.input_norm, mixer_index, position, count);
+                }
+            } else {
+                if self.records.delta_net.at(mixer_index) |delta_net| {
+                    encode_delta_net<D, P>(self, pass, delta_net, feed_forward.input_norm, mixer_index, base_slot, count);
+                }
+            }
+            encode_residual<D, P>(self, pass, count);
+            encode_feed_forward<D, P>(self, pass, feed_forward, count);
+            if capture_slot(layer) |slot| {
+                encode_capture<D, P>(self, pass, slot, count);
+            }
+        }
+    }
+    encode_prepare<D, P>(self, pass, self.layout.hidden, 5120, self.records.final_norm, self.records.output_head.input_sign_offset, 5120, true, count);
+    encode_projection<D, P>(self, pass, &self.records.output_head, 0, count);
+    return;
+}
+
+fn run_tokens<D, P>(self: &D, weights: &ModelWeights, embeddings: []f32, position: i64, count: i64) -> !void {
+    try load_token_inputs<D>(self, weights, embeddings, position, count);
+    let pass = try self.gpu.begin_compute_pass();
+    encode_tokens<D, P>(self, &pass, weights, position, count);
+    try pass.finish();
+    finish_tokens<D>(self);
+    if status_word<D>(self) != 0 {
+        return ModelError::KernelFailed;
+    }
+    return;
+}
+
+fn run_token<D, P>(self: &D, weights: &ModelWeights, embedding: []f32, position: i64) -> !void {
+    try run_tokens<D, P>(self, weights, embedding, position, 1);
+    advance_state_base<D>(self, 1);
+    return;
+}
+
+pub fn (self: &GpuDecoder) profile_tokens(weights: &ModelWeights, embeddings: []f32, position: i64, count: i64) -> !void {
+    try load_token_inputs<GpuDecoder>(self, weights, embeddings, position, count);
+    let pass = try self.gpu.begin_profiled_pass();
+    defer pass.release();
+    encode_tokens<GpuDecoder, metal::ProfiledPass>(self, &pass, weights, position, count);
+    try pass.finish();
+    finish_tokens<GpuDecoder>(self);
+    if status_word<GpuDecoder>(self) != 0 {
+        return ModelError::KernelFailed;
+    }
+    print("microseconds and dispatches per kernel:");
+    pass.print_kernel(&self.six_bit_sums, "six_bit_sums");
+    pass.print_kernel(&self.eight_bit_sums, "eight_bit_sums");
+    pass.print_kernel(&self.six_bit_batch_sums, "six_bit_batch_sums");
+    pass.print_kernel(&self.eight_bit_batch_sums, "eight_bit_batch_sums");
+    pass.print_kernel(&self.prepare, "prepare");
+    pass.print_kernel(&self.finish_activation, "finish_activation");
+    pass.print_kernel(&self.restore, "restore");
+    pass.print_kernel(&self.attention_keys, "attention_keys");
+    pass.print_kernel(&self.attention_queries, "attention_queries");
+    pass.print_kernel(&self.attention_scores, "attention_scores");
+    pass.print_kernel(&self.attention_weights, "attention_weights");
+    pass.print_kernel(&self.attention_output, "attention_output");
+    pass.print_kernel(&self.delta_convolution, "delta_convolution");
+    pass.print_kernel(&self.delta_query_key, "delta_query_key");
+    pass.print_kernel(&self.delta_gates, "delta_gates");
+    pass.print_kernel(&self.delta_recurrence, "delta_recurrence");
+    pass.print_kernel(&self.delta_output, "delta_output");
+    pass.print_kernel(&self.gated_product, "gated_product");
+    pass.print_kernel(&self.add_residual, "add_residual");
+    return;
+}
+
+fn ablation_commit(count: i64) -> i64 {
+    if count > 5 {
+        return 5;
+    }
+    return count;
+}
+
+fn ablation_group_count() -> i64 {
+    return 16;
+}
+
+fn ablation_group_name(group: i64) -> []u8 {
+    if group == 1 { return "six_bit row sums"; }
+    if group == 2 { return "eight_bit row sums"; }
+    if group == 3 { return "prepare"; }
+    if group == 4 { return "restore"; }
+    if group == 5 { return "attention all"; }
+    if group == 6 { return "delta_convolution"; }
+    if group == 7 { return "delta_query_key"; }
+    if group == 8 { return "delta_gates"; }
+    if group == 9 { return "delta_recurrence"; }
+    if group == 10 { return "delta_output"; }
+    if group == 11 { return "gated_product"; }
+    if group == 12 { return "add_residual"; }
+    if group == 13 { return "copy_rows"; }
+    if group == 14 { return "row sums and restore"; }
+    if group == 15 { return "everything but row sums"; }
+    return "nothing";
+}
+
+fn (self: &GpuDecoder) skip_group(pass: &var metal::SkippingPass, group: i64) -> void {
+    if group == 1 or group == 14 {
+        pass.skip(&self.six_bit_sums);
+        pass.skip(&self.six_bit_batch_sums);
+    }
+    if group == 2 or group == 14 {
+        pass.skip(&self.eight_bit_sums);
+        pass.skip(&self.eight_bit_batch_sums);
+    }
+    if group == 3 or group == 15 {
+        pass.skip(&self.prepare);
+        pass.skip(&self.finish_activation);
+    }
+    if group == 4 or group == 14 or group == 15 { pass.skip(&self.restore); }
+    if group == 5 or group == 15 {
+        pass.skip(&self.attention_keys);
+        pass.skip(&self.attention_queries);
+        pass.skip(&self.attention_scores);
+        pass.skip(&self.attention_weights);
+        pass.skip(&self.attention_output);
+    }
+    if group == 6 or group == 15 { pass.skip(&self.delta_convolution); }
+    if group == 7 or group == 15 { pass.skip(&self.delta_query_key); }
+    if group == 8 or group == 15 { pass.skip(&self.delta_gates); }
+    if group == 9 or group == 15 { pass.skip(&self.delta_recurrence); }
+    if group == 10 or group == 15 { pass.skip(&self.delta_output); }
+    if group == 11 or group == 15 { pass.skip(&self.gated_product); }
+    if group == 12 or group == 15 { pass.skip(&self.add_residual); }
+    if group == 13 or group == 15 { pass.skip(&self.copy_rows); }
+    return;
+}
+
+fn middle_of(values: &var []f64) -> f64 {
+    let count = mem::count<f64>(values.*);
+    for 1..count |index| {
+        let value = values[index];
+        var at = index;
+        while at > 0 and values[at - 1] > value {
+            values[at] = values[at - 1];
+            at = at - 1;
+        }
+        values[at] = value;
+    }
+    return values[count / 2];
+}
+
+/// Interleaves full passes with passes that drop one kernel group, and prints the median full time and saving per group.
+pub fn (self: &GpuDecoder) ablate_tokens(allocator: Allocator, weights: &ModelWeights, embeddings: []f32, position: i64, count: i64, rounds: i64) -> !void {
+    var seconds = array::new<f64>(allocator);
+    defer seconds.deinit(allocator);
+    for 0..rounds |round| {
+        for 0..ablation_group_count() |group| {
+            try load_token_inputs<GpuDecoder>(self, weights, embeddings, position, count);
+            var pass = try self.gpu.begin_skipping_pass();
+            self.skip_group(&var pass, group);
+            encode_tokens<GpuDecoder, metal::SkippingPass>(self, &pass, weights, position, count);
+            try seconds.append(allocator, try pass.finish_and_measure_gpu_seconds());
+            finish_tokens<GpuDecoder>(self);
+            advance_state_base<GpuDecoder>(self, ablation_commit(count));
+            if status_word<GpuDecoder>(self) != 0 {
+                return ModelError::KernelFailed;
+            }
+        }
+    }
+    let all = seconds.as_slice();
+    var column = array::new<f64>(allocator);
+    defer column.deinit(allocator);
+    print("tokens, rounds:");
+    print(count);
+    print(rounds);
+    print("group, median microseconds of the full pass or saved by dropping it:");
+    for 0..ablation_group_count() |group| {
+        column.clear(allocator);
+        for 0..rounds |round| {
+            let full = all[round * ablation_group_count()];
+            let ablated = all[round * ablation_group_count() + group];
+            if group == 0 {
+                try column.append(allocator, full);
+            } else {
+                try column.append(allocator, full - ablated);
+            }
+        }
+        var view = column.as_mut_slice();
+        print(ablation_group_name(group));
+        print(cast<i64>(middle_of(&var view) * 1000000.0));
+    }
+    return;
+}
+
+pub fn (self: &GpuDecoder) decode_token(weights: &ModelWeights, embedding: []f32, position: i64) -> !i64 {
+    try run_token<GpuDecoder, metal::ComputePass>(self, weights, embedding, position);
+    return self.greedy_at(weights, 0);
+}
+
+/// Runs count tokens from position without committing their delta state; commit_tokens keeps a prefix.
+pub fn (self: &GpuDecoder) run_batch(weights: &ModelWeights, embeddings: []f32, position: i64, count: i64) -> !void {
+    try run_tokens<GpuDecoder, metal::ComputePass>(self, weights, embeddings, position, count);
+    return;
+}
+
+pub fn (self: &GpuDecoder) commit_tokens(count: i64) -> void {
+    advance_state_base<GpuDecoder>(self, count);
+    return;
+}
+
+pub fn (self: &GpuDecoder) greedy_at(weights: &ModelWeights, token: i64) -> i64 {
+    // SAFETY: the last pass finished, and the first projected slot holds vocabulary_size logits per token.
+    let logit_cells = unsafe ptr_from_int<ptr<const f32>>(workspace_address<GpuDecoder>(self, projected_slot<GpuDecoder>(self, 0)) + cast<usize>(4 * token * projection_slot_values()));
+    // SAFETY: as above.
+    let logits = unsafe view_from_ptr(logit_cells, weights.vocabulary_size);
+    return greedy_token(logits);
+}
+
+pub fn (self: &GpuDecoder) copy_logits(allocator: Allocator, weights: &ModelWeights, out: &var array::Array<f32>) -> mem::Error!void {
+    // SAFETY: no GPU work is in flight, and the first projected slot holds vocabulary_size logits.
+    let logit_cells = unsafe ptr_from_int<ptr<const f32>>(workspace_address<GpuDecoder>(self, projected_slot<GpuDecoder>(self, 0)));
+    // SAFETY: as above.
+    let logits = unsafe view_from_ptr(logit_cells, weights.vocabulary_size);
+    for 0..weights.vocabulary_size |index| {
+        try out.append(allocator, logits[index]);
+    }
+    return;
+}

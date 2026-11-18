@@ -1,0 +1,251 @@
+import kizukani::mapped;
+import kizukani::model;
+import kizukani::yskn;
+import std::array;
+import std::mem;
+import std::process;
+
+pub fn model_path() -> ptr<const u8> {
+    return c"models/qwen38-27b-speed/qwen38_27b_speed.yskn";
+}
+
+fn new_projector(allocator: Allocator, on_gpu: bool, file_address: u64, file_byte_count: i64) -> !model::Projector {
+    if on_gpu {
+        // SAFETY: the caller releases the projector before the mapping.
+        return try unsafe model::new_gpu_projector(allocator, 16, file_address, cast<u64>(file_byte_count));
+    }
+    return try model::new_cpu_projector(allocator, 16);
+}
+
+pub fn run_plain_text_selfcheck(generated_count: i64, on_gpu: bool) -> !void {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(model_path());
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+
+    let load_started = process::unix_millis();
+    let weights = try model::load_model_weights(allocator, file, file_address, &header, 64);
+    defer weights.deinit(allocator);
+    print("weights loaded, milliseconds:");
+    print(process::unix_millis() - load_started);
+
+    var projector = try new_projector(allocator, on_gpu, file_address, mapping.length());
+    defer projector.deinit(allocator);
+    var state = try model::new_decode_state(allocator, &weights);
+    defer state.deinit(allocator);
+
+    let prompt = [5]i64{ 760, 6511, 314, 9338, 369 };
+    let expected = [12]i64{ 11751, 13, 198, 760, 6511, 314, 9564, 369, 19241, 13, 198, 760 };
+    let prompt_view = prompt.as_slice();
+    let expected_view = expected.as_slice();
+    var next_token: i64 = 0;
+    var position: i64 = 0;
+    for 0..5 |index| {
+        let started = process::unix_millis();
+        let logits = try model::forward_token(allocator, &var projector, file, &header, &weights, &var state, prompt_view[index], position);
+        defer logits.deinit(allocator);
+        let logit_view = logits.as_slice();
+        next_token = model::greedy_token(logit_view);
+        position = position + 1;
+        print("prompt token done, milliseconds:");
+        print(process::unix_millis() - started);
+    }
+    var matched: i64 = 0;
+    for 0..generated_count |index| {
+        print("generated token, expected:");
+        print(next_token);
+        if index < 12 {
+            print(expected_view[index]);
+            if next_token == expected_view[index] {
+                matched = matched + 1;
+            }
+        }
+        let started = process::unix_millis();
+        let logits = try model::forward_token(allocator, &var projector, file, &header, &weights, &var state, next_token, position);
+        defer logits.deinit(allocator);
+        let logit_view = logits.as_slice();
+        next_token = model::greedy_token(logit_view);
+        position = position + 1;
+        print("milliseconds:");
+        print(process::unix_millis() - started);
+    }
+    print("matched of expected:");
+    print(matched);
+    return;
+}
+
+pub fn run_gpu_decode_selfcheck(generated_count: i64) -> !void {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(model_path());
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+
+    let load_started = process::unix_millis();
+    let weights = try model::load_model_weights(allocator, file, file_address, &header, 64);
+    defer weights.deinit(allocator);
+    comptime if std::target::is_windows() {
+        // SAFETY: the mapping stays alive while the decoder copies it.
+        let decoder = try unsafe model::open_vulkan_decoder(allocator, &weights, file_address, cast<u64>(mapping.length()));
+        defer decoder.deinit(allocator);
+        print("decoder ready, milliseconds:");
+        print(process::unix_millis() - load_started);
+        try check_decoder<model::VulkanDecoder>(allocator, file, &header, &weights, &decoder, generated_count);
+        print("microseconds and dispatches per kernel:");
+        decoder.print_profile();
+    } else {
+        // SAFETY: the decoder is released before the mapping.
+        let decoder = try unsafe model::open_gpu_decoder(allocator, &weights, file_address, cast<u64>(mapping.length()), model::decode_maximum_positions());
+        defer decoder.deinit(allocator);
+        print("decoder ready, milliseconds:");
+        print(process::unix_millis() - load_started);
+        try check_decoder<model::GpuDecoder>(allocator, file, &header, &weights, &decoder, generated_count);
+        let embedding = try model::embed_token(allocator, file, &header, &weights, 760);
+        defer embedding.deinit(allocator);
+        let embedding_view = embedding.as_slice();
+        try decoder.profile_tokens(&weights, embedding_view, 5 + generated_count, 1);
+        var batch = array::new<f32>(allocator);
+        defer batch.deinit(allocator);
+        for 0..model::decode_batch_capacity() |token| {
+            for 0..mem::count<f32>(embedding_view) |index| {
+                try batch.append(allocator, embedding_view[index]);
+            }
+        }
+        let batch_view = batch.as_slice();
+        try decoder.profile_tokens(&weights, batch_view, 5 + generated_count, model::decode_batch_capacity());
+    }
+    return;
+}
+
+fn check_decoder<D>(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &model::ModelWeights, decoder: &D, generated_count: i64) -> !void {
+    let prompt = [5]i64{ 760, 6511, 314, 9338, 369 };
+    let expected = [12]i64{ 11751, 13, 198, 760, 6511, 314, 9564, 369, 19241, 13, 198, 760 };
+    let prompt_view = prompt.as_slice();
+    let expected_view = expected.as_slice();
+    var next_token: i64 = 0;
+    var position: i64 = 0;
+    var matched: i64 = 0;
+    var generated_milliseconds: i64 = 0;
+    for 0..(5 + generated_count) |step| {
+        var token = next_token;
+        if step < 5 {
+            token = prompt_view[step];
+        } else {
+            let index = step - 5;
+            print("generated token, expected:");
+            print(token);
+            if index < 12 {
+                print(expected_view[index]);
+                if token == expected_view[index] {
+                    matched = matched + 1;
+                }
+            }
+        }
+        let started = process::unix_millis();
+        let embedding = try model::embed_token(allocator, file, header, weights, token);
+        defer embedding.deinit(allocator);
+        let embedding_view = embedding.as_slice();
+        next_token = try decoder.decode_token(weights, embedding_view, position);
+        position = position + 1;
+        let elapsed = process::unix_millis() - started;
+        if step >= 5 {
+            generated_milliseconds = generated_milliseconds + elapsed;
+        }
+        print("milliseconds:");
+        print(elapsed);
+    }
+    print("matched of expected:");
+    print(matched);
+    print("mean milliseconds per generated token:");
+    print(generated_milliseconds / generated_count);
+    return;
+}
+
+pub fn run_gpu_decode_benchmark(prompt_count: i64, generated_count: i64) -> !void {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(model_path());
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    let weights = try model::load_model_weights(allocator, file, file_address, &header, 64);
+    defer weights.deinit(allocator);
+    // SAFETY: the decoder is released before the mapping.
+    let decoder = try unsafe model::open_gpu_decoder(allocator, &weights, file_address, cast<u64>(mapping.length()), model::decode_maximum_positions());
+    defer decoder.deinit(allocator);
+
+    let prompt_cycle = [17]i64{ 760, 6511, 314, 9338, 369, 11751, 13, 198, 760, 6511, 314, 9564, 369, 19241, 13, 198, 760 };
+    let cycle_view = prompt_cycle.as_slice();
+    var next_token: i64 = 0;
+    var generated_milliseconds: i64 = 0;
+    var last_quarter_milliseconds: i64 = 0;
+    for 0..(prompt_count + generated_count) |position| {
+        var token = next_token;
+        if position < prompt_count {
+            token = cycle_view[position % 17];
+        }
+        let started = process::unix_millis();
+        let embedding = try model::embed_token(allocator, file, &header, &weights, token);
+        defer embedding.deinit(allocator);
+        let embedding_view = embedding.as_slice();
+        next_token = try decoder.decode_token(&weights, embedding_view, position);
+        let elapsed = process::unix_millis() - started;
+        if position >= prompt_count {
+            generated_milliseconds = generated_milliseconds + elapsed;
+            if position >= prompt_count + generated_count - generated_count / 4 {
+                last_quarter_milliseconds = last_quarter_milliseconds + elapsed;
+            }
+        }
+    }
+    print("prompt tokens, generated tokens:");
+    print(prompt_count);
+    print(generated_count);
+    print("mean milliseconds per generated token:");
+    print(generated_milliseconds / generated_count);
+    print("mean milliseconds over the last quarter:");
+    print(last_quarter_milliseconds / (generated_count / 4));
+    return;
+}
+
+pub fn run_gpu_ablation(rounds: i64) -> !void {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(model_path());
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    let weights = try model::load_model_weights(allocator, file, file_address, &header, 64);
+    defer weights.deinit(allocator);
+    // SAFETY: the decoder is released before the mapping.
+    let decoder = try unsafe model::open_gpu_decoder(allocator, &weights, file_address, cast<u64>(mapping.length()), model::decode_maximum_positions());
+    defer decoder.deinit(allocator);
+    let embedding = try model::embed_token(allocator, file, &header, &weights, 760);
+    defer embedding.deinit(allocator);
+    let embedding_view = embedding.as_slice();
+    var batch = array::new<f32>(allocator);
+    defer batch.deinit(allocator);
+    for 0..model::decode_batch_capacity() |token| {
+        for 0..mem::count<f32>(embedding_view) |index| {
+            try batch.append(allocator, embedding_view[index]);
+        }
+    }
+    let batch_view = batch.as_slice();
+    try decoder.ablate_tokens(allocator, &weights, embedding_view, 16, 1, rounds);
+    try decoder.ablate_tokens(allocator, &weights, batch_view, 16, model::decode_batch_capacity(), rounds);
+    return;
+}

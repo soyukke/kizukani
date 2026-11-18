@@ -1,0 +1,510 @@
+import kizukani::mapped;
+import kizukani::model;
+import kizukani::text;
+import kizukani::yskn;
+import std::array;
+import std::fs;
+import std::io;
+import std::mem;
+import std::process;
+import std::string;
+
+extern "c" fn read(descriptor: i32, buffer: ptr<u8>, count: usize) -> i64
+extern "c" fn write(descriptor: i32, buffer: ptr<const u8>, count: usize) -> i64
+extern "c" fn isatty(descriptor: i32) -> i32
+fn write_output(bytes: []u8) -> void {
+    var done: i64 = 0;
+    while done < mem::len(bytes) {
+        let rest = bytes[done..mem::len(bytes)];
+        // SAFETY: rest is readable for its length during the call.
+        let written = unsafe write(1, ptr_of(rest), cast<usize>(mem::len(rest)));
+        if written <= 0 {
+            return;
+        }
+        done = done + written;
+    }
+    return;
+}
+
+fn write_line(bytes: []u8) -> void {
+    write_output(bytes);
+    let line_break = [1]u8{ 10 };
+    let line_break_view = line_break.as_bytes();
+    write_output(line_break_view);
+    return;
+}
+
+fn write_number(value: i64) -> void {
+    var digits = [20]u8{};
+    let digit_view = digits.as_mut_bytes();
+    var rest = value;
+    var first: i64 = 20;
+    while rest > 0 or first == 20 {
+        first = first - 1;
+        digit_view[first] = cast<u8>(48 + rest % 10);
+        rest = rest / 10;
+    }
+    write_output(digit_view[first..20]);
+    return;
+}
+
+fn progress_step() -> i64 {
+    return 128;
+}
+
+fn clear_progress() -> void {
+    let code = [5]u8{ 13, 27, 91, 50, 75 };
+    let code_view = code.as_bytes();
+    write_output(code_view);
+    return;
+}
+
+fn write_progress(done: i64, total: i64) -> void {
+    clear_progress();
+    write_output("reading input ");
+    write_number(done);
+    write_output("/");
+    write_number(total);
+    return;
+}
+
+/// Feeds tokens like prefill, showing how far it has come when show is set and the input is long.
+fn prefill_with_progress(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &model::ModelWeights, decoder: &model::GpuDecoder, tokens: []i64, start: i64, draft: &model::GpuDraft, show: bool) -> !void {
+    let count = mem::count<i64>(tokens) - 1;
+    if !show or count <= progress_step() {
+        try prefill<model::GpuDraft>(allocator, file, header, weights, decoder, tokens, start, draft);
+        return;
+    }
+    var done: i64 = 0;
+    while done < count {
+        write_progress(done, count);
+        var end = done + progress_step();
+        if end > count {
+            end = count;
+        }
+        try prefill<model::GpuDraft>(allocator, file, header, weights, decoder, tokens[done..end + 1], start + done, draft);
+        done = end;
+    }
+    clear_progress();
+    return;
+}
+
+/// Moves the next line of standard input into line; answers false once input has ended.
+fn read_line(allocator: Allocator, pending: &var string::String, line: &var string::String) -> !bool {
+    line.clear();
+    while true {
+        var line_end: i64 = -1;
+        if true {
+            let bytes = pending.as_bytes();
+            for 0..mem::len(bytes) |index| {
+                if line_end < 0 and bytes[index] == 10 {
+                    line_end = index;
+                }
+            }
+            if line_end >= 0 {
+                try line.append_bytes(allocator, bytes[0..line_end]);
+            }
+        }
+        if line_end >= 0 {
+            var rest = string::new(allocator);
+            defer rest.deinit(allocator);
+            if true {
+                let bytes = pending.as_bytes();
+                try rest.append_bytes(allocator, bytes[line_end + 1..mem::len(bytes)]);
+            }
+            pending.clear();
+            let rest_view = rest.as_bytes();
+            try pending.append_bytes(allocator, rest_view);
+            return true;
+        }
+        var chunk = [4096]u8{};
+        let chunk_view = chunk.as_mut_bytes();
+        // SAFETY: chunk_view is writable for its 4096 bytes during the call.
+        let count = unsafe read(0, unsafe cast<ptr<u8>>(ptr_of(chunk_view)), 4096);
+        if count <= 0 {
+            let bytes = pending.as_bytes();
+            let any = mem::len(bytes) > 0;
+            try line.append_bytes(allocator, bytes);
+            pending.clear();
+            return any;
+        }
+        try pending.append_bytes(allocator, chunk_view[0..count]);
+    }
+    return false;
+}
+
+fn complete_length(bytes: []u8) -> i64 {
+    let count = mem::len(bytes);
+    var back: i64 = 1;
+    while back <= 3 and back <= count {
+        let value = bytes[count - back];
+        if (value & 0xc0) != 0x80 {
+            var need: i64 = 1;
+            if value >= 0xf0 {
+                need = 4;
+            } else {
+                if value >= 0xe0 {
+                    need = 3;
+                } else {
+                    if value >= 0xc0 {
+                        need = 2;
+                    }
+                }
+            }
+            if need > back {
+                return count - back;
+            }
+            return count;
+        }
+        back = back + 1;
+    }
+    return count;
+}
+
+/// Writes generated tokens as they arrive, holding back any partial UTF-8 character.
+struct ReplyPrinter {
+    held: string::String,
+    styled: bool,
+    in_thinking: bool,
+    at_answer_start: bool,
+}
+
+fn (self: ReplyPrinter) deinit(allocator: Allocator) -> void {
+    self.held.deinit(allocator);
+    return;
+}
+
+fn (self: &var ReplyPrinter) set_dim(allocator: Allocator, on: bool) -> mem::Error!void {
+    if !self.styled {
+        return;
+    }
+    var code = string::new(allocator);
+    defer code.deinit(allocator);
+    try code.append_byte(allocator, 27);
+    if on {
+        try code.append_bytes(allocator, "[2m");
+    } else {
+        try code.append_bytes(allocator, "[0m");
+    }
+    let code_view = code.as_bytes();
+    write_output(code_view);
+    return;
+}
+
+fn (self: &var ReplyPrinter) flush(allocator: Allocator, everything: bool) -> mem::Error!void {
+    var keep: i64 = 0;
+    if true {
+        let bytes = self.held.as_bytes();
+        var length = mem::len(bytes);
+        if !everything {
+            length = complete_length(bytes);
+        }
+        write_output(bytes[0..length]);
+        keep = length;
+    }
+    var rest = string::new(allocator);
+    defer rest.deinit(allocator);
+    if true {
+        let bytes = self.held.as_bytes();
+        try rest.append_bytes(allocator, bytes[keep..mem::len(bytes)]);
+    }
+    self.held.clear();
+    let rest_view = rest.as_bytes();
+    try self.held.append_bytes(allocator, rest_view);
+    return;
+}
+
+fn (self: &var ReplyPrinter) emit(allocator: Allocator, tokenizer: &text::Tokenizer, token: i64) -> mem::Error!void {
+    if token == text::token_turn_end() or token == text::token_text_end() {
+        return;
+    }
+    if token == text::token_think_end() {
+        try self.flush(allocator, true);
+        try self.set_dim(allocator, false);
+        self.in_thinking = false;
+        self.at_answer_start = true;
+        write_line("");
+        write_line("--- answer ---");
+        return;
+    }
+    var bytes = string::new(allocator);
+    defer bytes.deinit(allocator);
+    try tokenizer.append_token_bytes(allocator, token, &var bytes);
+    let view = bytes.as_bytes();
+    var first: i64 = 0;
+    if self.at_answer_start {
+        while first < mem::len(view) and view[first] == 10 {
+            first = first + 1;
+        }
+        if first < mem::len(view) {
+            self.at_answer_start = false;
+        }
+    }
+    try self.held.append_bytes(allocator, view[first..mem::len(view)]);
+    try self.flush(allocator, false);
+    return;
+}
+
+fn number_argument(digits: []u8) -> i64 {
+    var value: i64 = 0;
+    for 0..mem::len(digits) |index| {
+        value = value * 10 + cast<i64>(digits[index]) - 48;
+    }
+    return value;
+}
+
+fn write_token_file(allocator: Allocator, path: []u8, tokens: []i64) -> !void {
+    var body = string::new(allocator);
+    defer body.deinit(allocator);
+    for 0..mem::count<i64>(tokens) |index| {
+        var digits = [20]u8{};
+        let digit_view = digits.as_mut_bytes();
+        var value = tokens[index];
+        var count: i64 = 0;
+        while value > 0 or count == 0 {
+            digit_view[count] = cast<u8>(48 + value % 10);
+            value = value / 10;
+            count = count + 1;
+        }
+        while count > 0 {
+            count = count - 1;
+            try body.append_byte(allocator, digit_view[count]);
+        }
+        try body.append_byte(allocator, 32);
+    }
+    let body_view = body.as_bytes();
+    try fs::write_file(io::blocking(), &path, body_view);
+    return;
+}
+
+fn write_chat_usage() -> void {
+    write_line("usage: kizukani chat [--no-think] [--model speed|quality] [--system TEXT] [--max-tokens N] [--dump-tokens PATH]");
+    return;
+}
+
+fn chat_tokenizer_path(quality: bool) -> []u8 {
+    if quality {
+        return "models/qwen38-27b-quality/tokenizer.json";
+    }
+    return "models/qwen38-27b-speed/tokenizer.json";
+}
+
+fn chat_weights_path(quality: bool) -> ptr<const u8> {
+    if quality {
+        return c"models/qwen38-27b-quality/qwen38_27b_quality.yskn";
+    }
+    return model_path();
+}
+
+fn chat_draft_path(quality: bool) -> ptr<const u8> {
+    if quality {
+        return c"models/qwen38-27b-quality/bdraft2_k8.yskn";
+    }
+    return draft_path();
+}
+
+fn chat_head_path(quality: bool) -> ptr<const u8> {
+    if quality {
+        return c"models/qwen38-27b-quality/bdraft2_k8.shead";
+    }
+    return head_path();
+}
+
+pub fn run_chat() -> !void {
+    let allocator = mem::page_allocator();
+    var thinking = true;
+    var maximum_reply: i64 = 2048;
+    var quality = false;
+    var system = string::new(allocator);
+    defer system.deinit(allocator);
+    var token_path = string::new(allocator);
+    defer token_path.deinit(allocator);
+    var argument: i64 = 1;
+    while argument < process::arg_count() {
+        let name = try process::arg(argument);
+        if mem::equal_bytes(name, "--no-think") {
+            thinking = false;
+            argument = argument + 1;
+        } else {
+            if argument + 1 >= process::arg_count() {
+                write_chat_usage();
+                return;
+            }
+            let value = try process::arg(argument + 1);
+            if mem::equal_bytes(name, "--model") {
+                if mem::equal_bytes(value, "quality") {
+                    quality = true;
+                } else {
+                    if !mem::equal_bytes(value, "speed") {
+                        write_chat_usage();
+                        return;
+                    }
+                }
+            } else if mem::equal_bytes(name, "--system") {
+                try system.append_bytes(allocator, value);
+            } else {
+                if mem::equal_bytes(name, "--max-tokens") {
+                    maximum_reply = number_argument(value);
+                } else {
+                    if mem::equal_bytes(name, "--dump-tokens") {
+                        try token_path.append_bytes(allocator, value);
+                    } else {
+                        write_chat_usage();
+                        return;
+                    }
+                }
+            }
+            argument = argument + 2;
+        }
+    }
+    write_line("loading the model...");
+    let tokenizer = try text::load_tokenizer(allocator, "data/unicode_tables.bin", chat_tokenizer_path(quality));
+    defer tokenizer.deinit(allocator);
+    let mapping = try mapped::map_read_only(chat_weights_path(quality));
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    let weights = try model::load_model_weights(allocator, file, file_address, &header, 64);
+    defer weights.deinit(allocator);
+    // SAFETY: the decoder is released before the mapping.
+    var decoder = try unsafe model::open_gpu_decoder(allocator, &weights, file_address, cast<u64>(mapping.length()), model::decode_maximum_positions());
+    defer decoder.deinit(allocator);
+    let draft_mapping = try mapped::map_read_only(chat_draft_path(quality));
+    defer draft_mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let draft_file = unsafe view_from_ptr(draft_mapping.first_byte(), draft_mapping.length());
+    let head_mapping = try mapped::map_read_only(chat_head_path(quality));
+    defer head_mapping.release();
+    // SAFETY: reading an address as an integer touches no memory.
+    let draft_address = cast<u64>(unsafe int_from_ptr<usize>(draft_mapping.first_byte()));
+    // SAFETY: as above.
+    let head_address = cast<u64>(unsafe int_from_ptr<usize>(head_mapping.first_byte()));
+    // SAFETY: both mappings outlive the draft, which is released first.
+    let draft = try unsafe model::open_gpu_draft(allocator, &decoder, draft_file, draft_address, head_address, cast<u64>(head_mapping.length()));
+    defer draft.deinit(allocator);
+    let mask = try model::embed_token(allocator, file, &header, &weights, model::draft_mask_token());
+    defer mask.deinit(allocator);
+    let mask_view = mask.as_slice();
+    // SAFETY: isatty only reads the descriptor number.
+    let styled = unsafe isatty(1) == 1;
+    var history = array::new<i64>(allocator);
+    defer history.deinit(allocator);
+    var cursor = DecodeCursor { frontier: 0, position: 0, context_rows: 0, passes: 0, draft_milliseconds: 0, verify_milliseconds: 0 };
+    var pending = string::new(allocator);
+    defer pending.deinit(allocator);
+    var line = string::new(allocator);
+    defer line.deinit(allocator);
+    var turns: i64 = 0;
+    var reply_closed = true;
+    let no_expected = array::new<i64>(allocator);
+    defer no_expected.deinit(allocator);
+    let expected_view = no_expected.as_slice();
+    write_line("ready. type a message; /exit or end of input quits.");
+    while true {
+        write_output("> ");
+        let more = try read_line(allocator, &var pending, &var line);
+        if !more {
+            break;
+        }
+        let user = line.as_bytes();
+        if mem::equal_bytes(user, "/exit") {
+            break;
+        }
+        if mem::len(user) == 0 {
+            continue;
+        }
+        var prompt = string::new(allocator);
+        defer prompt.deinit(allocator);
+        if turns == 0 {
+            let system_view = system.as_bytes();
+            try tokenizer.append_first_turn(allocator, system_view, user, thinking, &var prompt);
+        } else {
+            if !reply_closed {
+                try prompt.append_bytes(allocator, "<|im_end|>");
+            }
+            try tokenizer.append_next_turn(allocator, user, thinking, &var prompt);
+        }
+        var inputs = array::new<i64>(allocator);
+        defer inputs.deinit(allocator);
+        if turns > 0 {
+            try inputs.append(allocator, cursor.frontier);
+        }
+        let first_new = inputs.len();
+        let prompt_view = prompt.as_bytes();
+        try tokenizer.encode(allocator, prompt_view, &var inputs);
+        let needed_positions = cursor.position + inputs.len() + maximum_reply + model::decode_batch_capacity();
+        if needed_positions > model::chat_maximum_positions() {
+            write_line("the conversation is too long for the context; start a new chat.");
+            break;
+        }
+        if cursor.context_rows > 0 {
+            try draft.push_context(&decoder, cursor.position - cursor.context_rows, cursor.context_rows);
+            cursor.context_rows = 0;
+        }
+        var capacity = decoder.maximum_positions();
+        while capacity < needed_positions {
+            capacity = capacity * 2;
+        }
+        try decoder.grow_positions(&weights, capacity, cursor.position);
+        let input_view = inputs.as_slice();
+        for first_new..inputs.len() |index| {
+            try history.append(allocator, input_view[index]);
+        }
+        let prefill_started = process::unix_millis();
+        try prefill_with_progress(allocator, file, &header, &weights, &decoder, input_view, cursor.position, &draft, styled);
+        let prefill_milliseconds = process::unix_millis() - prefill_started;
+        cursor.position = cursor.position + inputs.len() - 1;
+        cursor.frontier = input_view[inputs.len() - 1];
+        var printer = ReplyPrinter { held: string::new(allocator), styled: styled, in_thinking: thinking, at_answer_start: !thinking };
+        defer printer.deinit(allocator);
+        if thinking {
+            try printer.set_dim(allocator, true);
+        }
+        var reply = array::new<i64>(allocator);
+        defer reply.deinit(allocator);
+        let generation_started = process::unix_millis();
+        let passes_before = cursor.passes;
+        var emitted: i64 = 0;
+        var stopped = false;
+        while !stopped and reply.len() < maximum_reply {
+            let room = maximum_reply - reply.len() - 1;
+            stopped = try decode_pass<model::GpuDraft>(allocator, file, &header, &weights, &decoder, &draft, draft_file, mask_view, DraftMode::Both, expected_view, room, true, &var history, &var reply, &var cursor);
+            let reply_view = reply.as_slice();
+            while emitted < reply.len() {
+                try printer.emit(allocator, &tokenizer, reply_view[emitted]);
+                emitted = emitted + 1;
+            }
+        }
+        try printer.flush(allocator, true);
+        try printer.set_dim(allocator, false);
+        reply_closed = stopped;
+        let generation_milliseconds = process::unix_millis() - generation_started;
+        write_line("");
+        var rate: i64 = 0;
+        if generation_milliseconds > 0 {
+            rate = reply.len() * 10000 / generation_milliseconds;
+        }
+        write_output("[");
+        write_number(reply.len());
+        write_output(" tokens, ");
+        write_number(rate / 10);
+        write_output(".");
+        write_number(rate % 10);
+        write_output(" tok/s, ");
+        write_number(cursor.passes - passes_before);
+        write_output(" passes, prefill ");
+        write_number(prefill_milliseconds);
+        write_line(" ms]");
+        turns = turns + 1;
+    }
+    if token_path.len() > 0 {
+        let path_view = token_path.as_bytes();
+        let history_view = history.as_slice();
+        try write_token_file(allocator, path_view, history_view);
+    }
+    return;
+}

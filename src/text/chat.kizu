@@ -1,0 +1,193 @@
+import std::array;
+import std::mem;
+import std::string;
+
+pub fn token_think_end() -> i64 {
+    return 248069;
+}
+
+pub fn token_turn_end() -> i64 {
+    return 248046;
+}
+
+pub fn token_text_end() -> i64 {
+    return 248044;
+}
+
+fn reasoning_instructions() -> []u8 {
+    return "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+}
+
+/// Appends a template literal, whose two characters backslash and n stand for a line break.
+fn append_template(allocator: Allocator, literal: []u8, out: &var string::String) -> mem::Error!void {
+    var at: i64 = 0;
+    while at < mem::len(literal) {
+        if literal[at] == 92 and at + 1 < mem::len(literal) and literal[at + 1] == 110 {
+            try out.append_byte(allocator, 10);
+            at = at + 2;
+        } else {
+            try out.append_byte(allocator, literal[at]);
+            at = at + 1;
+        }
+    }
+    return;
+}
+
+fn (self: &Tokenizer) append_trimmed(allocator: Allocator, text: []u8, out: &var string::String) -> mem::Error!void {
+    var first: i64 = -1;
+    var last: i64 = 0;
+    var at: i64 = 0;
+    while at < mem::len(text) {
+        let decoded = decode_point(text, at);
+        let length = cast<i64>(decoded >> 32);
+        if (self.tables.class_of(cast<u32>(decoded & 0xffffffff)) & class_space()) == 0 {
+            if first < 0 {
+                first = at;
+            }
+            last = at + length;
+        }
+        at = at + length;
+    }
+    if first >= 0 {
+        try out.append_bytes(allocator, text[first..last]);
+    }
+    return;
+}
+
+fn (self: &Tokenizer) append_user_turn(allocator: Allocator, user: []u8, thinking: bool, out: &var string::String) -> mem::Error!void {
+    try append_template(allocator, "<|im_start|>user\n", out);
+    try self.append_trimmed(allocator, user, out);
+    try append_template(allocator, "<|im_end|>\n<|im_start|>assistant\n", out);
+    if thinking {
+        try append_template(allocator, "<think>\n", out);
+    } else {
+        try append_template(allocator, "<think>\n\n</think>\n\n", out);
+    }
+    return;
+}
+
+/// Appends the prompt text of a conversation's first turn.
+pub fn (self: &Tokenizer) append_first_turn(allocator: Allocator, system: []u8, user: []u8, thinking: bool, out: &var string::String) -> mem::Error!void {
+    var trimmed = string::new(allocator);
+    defer trimmed.deinit(allocator);
+    try self.append_trimmed(allocator, system, &var trimmed);
+    let content = trimmed.as_bytes();
+    if thinking or mem::len(content) > 0 {
+        try append_template(allocator, "<|im_start|>system\n", out);
+        if thinking {
+            try out.append_bytes(allocator, reasoning_instructions());
+            if mem::len(content) > 0 {
+                try append_template(allocator, "\n\n", out);
+            }
+        }
+        try out.append_bytes(allocator, content);
+        try append_template(allocator, "<|im_end|>\n", out);
+    }
+    try self.append_user_turn(allocator, user, thinking, out);
+    return;
+}
+
+/// Appends the prompt text that follows an assistant reply ending in the turn-end token.
+pub fn (self: &Tokenizer) append_next_turn(allocator: Allocator, user: []u8, thinking: bool, out: &var string::String) -> mem::Error!void {
+    try out.append_byte(allocator, 10);
+    try self.append_user_turn(allocator, user, thinking, out);
+    return;
+}
+
+fn same_tokens(first: []i64, second: []i64) -> bool {
+    if mem::count<i64>(first) != mem::count<i64>(second) {
+        return false;
+    }
+    for 0..mem::count<i64>(first) |index| {
+        if first[index] != second[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Counts the lines of a chat fixture whose first or second prompt differs from the rendered tokens.
+pub fn (self: &Tokenizer) count_chat_mismatches(allocator: Allocator, fixture: []u8) -> mem::Error!i64 {
+    var mismatches: i64 = 0;
+    var cases: i64 = 0;
+    var line: i64 = 0;
+    while line < mem::len(fixture) {
+        let line_end = field_end(fixture, line, 10);
+        var bounds = [9]i64{};
+        let bound_view = bounds.as_mut_slice();
+        bound_view[0] = line;
+        for 1..9 |field| {
+            bound_view[field] = field_end(fixture, bound_view[field - 1], 9) + 1;
+        }
+        let thinking = fixture[line] == 49;
+        var system = string::new(allocator);
+        defer system.deinit(allocator);
+        var user = string::new(allocator);
+        defer user.deinit(allocator);
+        var reasoning = string::new(allocator);
+        defer reasoning.deinit(allocator);
+        var content = string::new(allocator);
+        defer content.deinit(allocator);
+        var next_user = string::new(allocator);
+        defer next_user.deinit(allocator);
+        try append_hex(allocator, fixture[bound_view[1]..bound_view[2] - 1], &var system);
+        try append_hex(allocator, fixture[bound_view[2]..bound_view[3] - 1], &var user);
+        try append_hex(allocator, fixture[bound_view[3]..bound_view[4] - 1], &var reasoning);
+        try append_hex(allocator, fixture[bound_view[4]..bound_view[5] - 1], &var content);
+        try append_hex(allocator, fixture[bound_view[5]..bound_view[6] - 1], &var next_user);
+        var expected_first = array::new<i64>(allocator);
+        defer expected_first.deinit(allocator);
+        var expected_second = array::new<i64>(allocator);
+        defer expected_second.deinit(allocator);
+        try append_numbers(allocator, fixture[bound_view[6]..bound_view[7] - 1], &var expected_first);
+        try append_numbers(allocator, fixture[bound_view[7]..line_end], &var expected_second);
+        var first_text = string::new(allocator);
+        defer first_text.deinit(allocator);
+        let system_view = system.as_bytes();
+        let user_view = user.as_bytes();
+        try self.append_first_turn(allocator, system_view, user_view, thinking, &var first_text);
+        var tokens = array::new<i64>(allocator);
+        defer tokens.deinit(allocator);
+        let first_view = first_text.as_bytes();
+        try self.encode(allocator, first_view, &var tokens);
+        let token_view = tokens.as_slice();
+        let expected_view = expected_first.as_slice();
+        var same = same_tokens(token_view, expected_view);
+        let reasoning_view = reasoning.as_bytes();
+        if !thinking or mem::len(reasoning_view) > 0 {
+            var reply = string::new(allocator);
+            defer reply.deinit(allocator);
+            if thinking {
+                try self.append_trimmed(allocator, reasoning_view, &var reply);
+                try append_template(allocator, "\n</think>\n\n", &var reply);
+            }
+            let content_view = content.as_bytes();
+            try self.append_trimmed(allocator, content_view, &var reply);
+            try reply.append_bytes(allocator, "<|im_end|>");
+            let reply_view = reply.as_bytes();
+            try self.encode(allocator, reply_view, &var tokens);
+            var next_text = string::new(allocator);
+            defer next_text.deinit(allocator);
+            let next_view = next_user.as_bytes();
+            try self.append_next_turn(allocator, next_view, thinking, &var next_text);
+            let next_text_view = next_text.as_bytes();
+            try self.encode(allocator, next_text_view, &var tokens);
+            let whole_view = tokens.as_slice();
+            let second_view = expected_second.as_slice();
+            same = same and same_tokens(whole_view, second_view);
+        }
+        if !same {
+            mismatches = mismatches + 1;
+            if mismatches <= 8 {
+                print("chat mismatch at case:");
+                print(cases);
+            }
+        }
+        cases = cases + 1;
+        line = line_end + 1;
+    }
+    print("chat cases, mismatches:");
+    print(cases);
+    print(mismatches);
+    return mismatches;
+}

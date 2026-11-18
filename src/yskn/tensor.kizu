@@ -1,0 +1,177 @@
+import std::mem;
+
+pub fn weights_per_sequence() -> i64 {
+    return 256;
+}
+
+pub fn steps_per_sequence() -> i64 {
+    return 128;
+}
+
+pub fn state_bit_count() -> i64 {
+    return 12;
+}
+
+pub fn hadamard_block_width() -> i64 {
+    return 512;
+}
+
+pub fn sequences_per_row(tensor: &TensorRecord) -> i64 {
+    return tensor.cols / weights_per_sequence();
+}
+
+pub fn words_per_sequence(tensor: &TensorRecord) -> i64 {
+    return 4 * tensor.bits_per_step;
+}
+
+pub fn code_word_index(tensor: &TensorRecord, row: i64, sequence: i64, word: i64) -> i64 {
+    match tensor.layout {
+        Row => return (row * sequences_per_row(tensor) + sequence) * words_per_sequence(tensor) + word,
+        Warp => {
+            let sequence_row = sequence * tensor.physical_rows + row;
+            let row_group = sequence_row / 32;
+            let lane = sequence_row % 32;
+            return ((row_group * tensor.bits_per_step + word / 4) * 32 + lane) * 4 + word % 4;
+        },
+    }
+}
+
+pub fn code_word(file: []u8, tensor: &TensorRecord, row: i64, sequence: i64, word: i64) -> u32 {
+    let offset = tensor.code_offset + 4 * code_word_index(tensor, row, sequence, word);
+    return cast<u32>(read_little_endian(file, offset, 4));
+}
+
+fn sequence_bit(file: []u8, tensor: &TensorRecord, row: i64, sequence: i64, bit: i64) -> u32 {
+    let word = code_word(file, tensor, row, sequence, bit / 32);
+    return (word >> cast<u32>(bit % 32)) & 1;
+}
+
+pub fn step_state(file: []u8, tensor: &TensorRecord, row: i64, sequence: i64, step: i64) -> u16 {
+    let first_bit = tensor.bits_per_step * (step + 1) - state_bit_count();
+    var state: u32 = 0;
+    for 0..state_bit_count() |offset| {
+        let bit = first_bit + offset;
+        if bit >= 0 {
+            state = state | (sequence_bit(file, tensor, row, sequence, bit) << cast<u32>(offset));
+        }
+    }
+    return cast<u16>(state);
+}
+
+pub fn row_scale(file: []u8, tensor: &TensorRecord, row: i64) -> f32 {
+    return f16_to_f32(cast<u16>(read_little_endian(file, tensor.row_scales_offset + 2 * row, 2)));
+}
+
+pub fn state_value(file: []u8, tensor: &TensorRecord, index: i64) -> f32 {
+    return f16_to_f32(cast<u16>(read_little_endian(file, tensor.state_values_offset + 2 * index, 2)));
+}
+
+pub fn fill_rotated_row(file: []u8, tensor: &TensorRecord, row: i64, values: &var []f32) -> void {
+    let scale = row_scale(file, tensor, row);
+    for 0..sequences_per_row(tensor) |sequence| {
+        for 0..steps_per_sequence() |step| {
+            let state = cast<i64>(step_state(file, tensor, row, sequence, step));
+            let column = sequence * weights_per_sequence() + 2 * step;
+            values[column] = scale * state_value(file, tensor, 2 * state);
+            values[column + 1] = scale * state_value(file, tensor, 2 * state + 1);
+        }
+    }
+    return;
+}
+
+fn inverse_sqrt_of_hadamard_width() -> f32 {
+    return binary32_from_bits(0x3d3504f3);
+}
+
+pub fn normalized_hadamard_in_place(values: &var []f32, first: i64, stride_between_elements: i64) -> void {
+    var half_width: i64 = 1;
+    while half_width < hadamard_block_width() {
+        var base: i64 = 0;
+        while base < hadamard_block_width() {
+            for 0..half_width |offset| {
+                let lower_index = first + (base + offset) * stride_between_elements;
+                let upper_index = first + (base + offset + half_width) * stride_between_elements;
+                let lower = values[lower_index];
+                let upper = values[upper_index];
+                values[lower_index] = lower + upper;
+                values[upper_index] = lower - upper;
+            }
+            base = base + 2 * half_width;
+        }
+        half_width = half_width * 2;
+    }
+    let scale = inverse_sqrt_of_hadamard_width();
+    for 0..hadamard_block_width() |index| {
+        let position = first + index * stride_between_elements;
+        values[position] = values[position] * scale;
+    }
+    return;
+}
+
+fn sign_as_f32(rotation: SignedHadamard, position: i64) -> f32 {
+    if stream_sign(rotation.sign_rule, rotation.sign_seed, rotation.sign_offset + cast<u64>(position)) > 0 {
+        return cast<f32>(1.0);
+    }
+    return cast<f32>(-1.0);
+}
+
+pub fn restore_original_coordinates(tensor: &TensorRecord, rotated_rows: &var []f32) -> void {
+    let cols = tensor.cols;
+    for 0..tensor.rows |row| {
+        for 0..(cols / hadamard_block_width()) |block| {
+            normalized_hadamard_in_place(rotated_rows, row * cols + block * hadamard_block_width(), 1);
+        }
+        for 0..cols |col| {
+            rotated_rows[row * cols + col] = rotated_rows[row * cols + col] * sign_as_f32(tensor.input_rotation, col);
+        }
+    }
+    match tensor.output_rotation {
+        Rotated(rotation) => {
+            for 0..(tensor.rows / hadamard_block_width()) |block| {
+                for 0..cols |col| {
+                    normalized_hadamard_in_place(rotated_rows, block * hadamard_block_width() * cols + col, cols);
+                }
+            }
+            for 0..tensor.rows |row| {
+                let sign = sign_as_f32(rotation, row);
+                for 0..cols |col| {
+                    rotated_rows[row * cols + col] = rotated_rows[row * cols + col] * sign;
+                }
+            }
+        },
+        Unrotated => {},
+    }
+    return;
+}
+
+pub fn vector_value(file: []u8, vector: &VectorRecord, index: i64) -> f32 {
+    let bits = cast<u16>(read_little_endian(file, vector.offset + 2 * index, 2));
+    match vector.encoding {
+        F16 => return f16_to_f32(bits),
+        Bf16 => return bf16_to_f32(bits),
+    }
+}
+
+pub fn find_tensor(header: &ContainerHeader, name: []u8) -> ?i64 {
+    var index: i64 = 0;
+    while header.tensors.at(index) |tensor| {
+        let tensor_name = tensor.name.as_bytes();
+        if mem::equal_bytes(tensor_name, name) {
+            return index;
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+pub fn find_vector(header: &ContainerHeader, name: []u8) -> ?i64 {
+    var index: i64 = 0;
+    while header.vectors.at(index) |vector| {
+        let vector_name = vector.name.as_bytes();
+        if mem::equal_bytes(vector_name, name) {
+            return index;
+        }
+        index = index + 1;
+    }
+    return null;
+}

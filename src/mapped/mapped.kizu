@@ -1,0 +1,145 @@
+extern "c" fn open(path: ptr<const u8>, flags: i32) -> i32
+extern "c" fn close(descriptor: i32) -> i32
+extern "c" fn lseek(descriptor: i32, offset: i64, whence: i32) -> i64
+extern "c" fn mmap(address: ?ptr<u8>, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> ?ptr<u8>
+extern "c" fn munmap(address: ptr<u8>, length: usize) -> i32
+@link_library("kernel32")
+extern "c" fn CreateFileA(name: ptr<const u8>, access: u32, share: u32, security: usize, disposition: u32, flags: u32, template: usize) -> usize
+@link_library("kernel32")
+extern "c" fn GetFileSizeEx(file: usize, size: ptr<i64>) -> i32
+@link_library("kernel32")
+extern "c" fn CreateFileMappingA(file: usize, security: usize, protection: u32, high: u32, low: u32, name: usize) -> usize
+@link_library("kernel32")
+extern "c" fn MapViewOfFile(mapping: usize, access: u32, high: u32, low: u32, byte_count: usize) -> ?ptr<u8>
+@link_library("kernel32")
+extern "c" fn UnmapViewOfFile(address: ptr<u8>) -> i32
+@link_library("kernel32")
+extern "c" fn CloseHandle(handle: usize) -> i32
+
+pub error MapError {
+    OpenFailed,
+    SizeFailed,
+    EmptyFile,
+    MapFailed,
+}
+
+fn open_read_only() -> i32 {
+    return 0;
+}
+
+fn seek_end() -> i32 {
+    return 2;
+}
+
+fn protection_read() -> i32 {
+    return 1;
+}
+
+fn map_private() -> i32 {
+    return 2;
+}
+
+fn map_failed_address() -> usize {
+    let all_bits_set: usize = 0;
+    return ~all_bits_set;
+}
+
+fn close_ignoring_failure(descriptor: i32) -> void {
+    // SAFETY: the caller passes a descriptor it opened and no longer uses.
+    unsafe close(descriptor);
+    return;
+}
+
+/// address is a read-only private mapping of byte_count bytes that release() unmaps.
+pub unsafe struct MappedFile {
+    address: ptr<u8>,
+    byte_count: i64,
+}
+
+pub fn map_read_only(path: ptr<const u8>) -> MapError!MappedFile {
+    comptime if std::target::is_windows() {
+        return map_read_only_on_windows(path);
+    } else {
+        return map_read_only_on_posix(path);
+    }
+}
+
+fn close_handle_ignoring_failure(handle: usize) -> void {
+    // SAFETY: the caller passes a handle it opened and no longer uses.
+    unsafe CloseHandle(handle);
+    return;
+}
+
+fn map_read_only_on_windows(path: ptr<const u8>) -> MapError!MappedFile {
+    // SAFETY: path is a NUL-terminated file name; the call opens it for shared reading.
+    let file = unsafe CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if file == map_failed_address() {
+        return MapError::OpenFailed;
+    }
+    defer close_handle_ignoring_failure(file);
+    var size_storage = [1]i64{};
+    let size_cells = size_storage.as_mut_slice();
+    // SAFETY: GetFileSizeEx writes the length into the one cell.
+    if unsafe GetFileSizeEx(file, mut_ptr_of(size_cells)) == 0 {
+        return MapError::SizeFailed;
+    }
+    let byte_count = size_cells[0];
+    if byte_count == 0 {
+        return MapError::EmptyFile;
+    }
+    // SAFETY: a read-only mapping object of the whole open file.
+    let mapping = unsafe CreateFileMappingA(file, 0, 2, 0, 0, 0);
+    if mapping == 0 {
+        return MapError::MapFailed;
+    }
+    defer close_handle_ignoring_failure(mapping);
+    // SAFETY: a read-only view of the whole mapping, which stays alive after its handle closes.
+    let mapped = unsafe MapViewOfFile(mapping, 4, 0, 0, 0) orelse return MapError::MapFailed;
+    // SAFETY: mapped is a live view of byte_count bytes, as the fields promise.
+    return unsafe MappedFile { address: mapped, byte_count: byte_count };
+}
+
+fn map_read_only_on_posix(path: ptr<const u8>) -> MapError!MappedFile {
+    // SAFETY: path is a NUL-terminated file name.
+    let descriptor = unsafe open(path, open_read_only());
+    if descriptor < 0 {
+        return MapError::OpenFailed;
+    }
+    defer close_ignoring_failure(descriptor);
+    // SAFETY: lseek on an open descriptor only reports its length.
+    let byte_count = unsafe lseek(descriptor, 0, seek_end());
+    if byte_count < 0 {
+        return MapError::SizeFailed;
+    }
+    if byte_count == 0 {
+        return MapError::EmptyFile;
+    }
+    // SAFETY: a private read-only mapping of an open file of byte_count bytes.
+    let mapped = unsafe mmap(null, cast<usize>(byte_count), protection_read(), map_private(), descriptor, 0) orelse return MapError::MapFailed;
+    // SAFETY: reading the address as an integer touches no memory.
+    if unsafe int_from_ptr<usize>(mapped) == map_failed_address() {
+        return MapError::MapFailed;
+    }
+    // SAFETY: mapped is a live mapping of byte_count bytes, as the fields promise.
+    return unsafe MappedFile { address: mapped, byte_count: byte_count };
+}
+
+pub fn (self: &MappedFile) first_byte() -> ptr<const u8> {
+    // SAFETY: the cast only retypes the same address as const bytes.
+    return unsafe cast<ptr<const u8>>(self.address);
+}
+
+pub fn (self: &MappedFile) length() -> i64 {
+    return self.byte_count;
+}
+
+pub fn (self: MappedFile) release() -> void {
+    comptime if std::target::is_windows() {
+        // SAFETY: self holds the view, and no view of it is used after this.
+        unsafe UnmapViewOfFile(self.address);
+    } else {
+        // SAFETY: self holds the mapping, and no view of it is used after this.
+        unsafe munmap(self.address, cast<usize>(self.byte_count));
+    }
+    return;
+}

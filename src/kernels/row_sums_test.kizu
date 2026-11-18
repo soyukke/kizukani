@@ -1,0 +1,277 @@
+import kizukani::metal;
+import std::fs;
+import std::io;
+import std::mem;
+import std::rand;
+import std::string;
+import std::testing;
+
+fn generated_source(allocator: Allocator) -> !string::String {
+    let path = "target/kernels.metal";
+    return fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+}
+
+fn bind_values(pass: &metal::ComputePass, index: u64, values: []i64) -> void {
+    // SAFETY: the values are 8 * count readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(values));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, mem::count<i64>(values) * 8);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn code_state(words: []u32, base: i64, bits_per_step: i64, step: i64) -> i64 {
+    var state: i64 = 0;
+    for 0..12 |offset| {
+        let bit = bits_per_step * (step + 1) - 12 + offset;
+        if bit >= 0 {
+            let word = bit / 32;
+            let cell = words[base + (word / 4) * 128 + word % 4];
+            state = state | (cast<i64>((cell >> cast<u32>(bit % 32)) & 1) << offset);
+        }
+    }
+    return state;
+}
+
+fn reference_row_sum(codes: []u32, table: []i8, activation: []i8, block_weights: []i64, bits_per_step: i64, physical_rows: i64, sequences: i64, row: i64) -> i64 {
+    var total: i64 = 0;
+    for 0..sequences |sequence| {
+        let sequence_row = sequence * physical_rows + row;
+        let base = (sequence_row / 32) * bits_per_step * 128 + (sequence_row % 32) * 4;
+        var dot: i64 = 0;
+        for 0..128 |step| {
+            let state = code_state(codes, base, bits_per_step, step);
+            let column = sequence * 256 + 2 * step;
+            dot = dot + cast<i64>(table[2 * state]) * cast<i64>(activation[column]) + cast<i64>(table[2 * state + 1]) * cast<i64>(activation[column + 1]);
+        }
+        total = total + block_weights[sequence / 2] * dot;
+    }
+    return total;
+}
+
+fn fill_bytes(buffer: &metal::Buffer, count: i64, seed: i64) -> void {
+    // SAFETY: the buffer holds count bytes, and no GPU work uses it yet.
+    let values = unsafe mut_view_from_ptr(unsafe cast<ptr<u8>>(buffer.contents()), count);
+    var random = rand::new(seed);
+    for 0..count |index| {
+        values[index] = cast<u8>(random.below(256));
+    }
+    return;
+}
+
+fn fill_block_weights(buffer: &metal::Buffer, count: i64, seed: i64) -> void {
+    // SAFETY: the buffer holds count i64, and no GPU work uses it yet.
+    let values = unsafe mut_view_from_ptr(unsafe cast<ptr<i64>>(buffer.contents()), count);
+    var random = rand::new(seed);
+    for 0..count |index| {
+        values[index] = cast<i64>(random.below(16777216));
+    }
+    return;
+}
+
+fn compare_row_sums(bits_per_step: i64, name: ptr<const u8>) -> !void {
+    let allocator = mem::page_allocator();
+    let source = try generated_source(allocator);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let generated = try library.kernel(&gpu, name);
+    defer generated.release();
+
+    let physical_rows: i64 = 256;
+    let sequences: i64 = 20;
+    let code_count = sequences * (physical_rows / 32) * bits_per_step * 128;
+    let codes = try gpu.new_shared_buffer(cast<u64>(code_count * 4));
+    defer codes.release();
+    let weight_pairs = try gpu.new_shared_buffer(8192);
+    defer weight_pairs.release();
+    let activation = try gpu.new_shared_buffer(cast<u64>(sequences * 256));
+    defer activation.release();
+    let block_weights = try gpu.new_shared_buffer(cast<u64>(sequences / 2 * 8));
+    defer block_weights.release();
+    let generated_sums = try gpu.new_shared_buffer(cast<u64>(physical_rows * 8));
+    defer generated_sums.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    fill_bytes(&codes, code_count * 4, 11);
+    fill_bytes(&weight_pairs, 8192, 12);
+    fill_bytes(&activation, sequences * 256, 13);
+    fill_block_weights(&block_weights, sequences / 2, 14);
+    // SAFETY: the status buffer holds one u32, and no GPU work uses it yet.
+    let status_words = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(status.contents()), 1);
+    status_words[0] = 0;
+
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &codes);
+    pass.bind_buffer(1, &weight_pairs);
+    pass.bind_buffer(2, &activation);
+    pass.bind_buffer(3, &block_weights);
+    pass.bind_buffer(4, &generated_sums);
+    let rows_value = [1]i64{ physical_rows };
+    let rows_view = rows_value.as_slice();
+    bind_values(&pass, 5, rows_view);
+    let sequence_value = [1]i64{ sequences };
+    let sequence_view = sequence_value.as_slice();
+    bind_values(&pass, 6, sequence_view);
+    let lengths = [5]i64{ code_count, 4096, sequences * 256, sequences / 2, physical_rows };
+    let length_view = lengths.as_slice();
+    bind_values(&pass, 7, length_view);
+    pass.bind_buffer(8, &status);
+    pass.dispatch_threadgroups(&generated, cast<u64>(physical_rows / 32), 128);
+    try pass.finish();
+
+    testing::expect_equal<u32>(0, status_words[0]);
+    // SAFETY: the pass finished, and each buffer holds the counts filled above.
+    let sums = unsafe view_from_ptr(unsafe cast<ptr<const i64>>(generated_sums.contents()), physical_rows);
+    // SAFETY: as above.
+    let code_view = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(codes.contents()), code_count);
+    // SAFETY: as above.
+    let table_view = unsafe view_from_ptr(unsafe cast<ptr<const i8>>(weight_pairs.contents()), 8192);
+    // SAFETY: as above.
+    let activation_view = unsafe view_from_ptr(unsafe cast<ptr<const i8>>(activation.contents()), sequences * 256);
+    // SAFETY: as above.
+    let block_weight_view = unsafe view_from_ptr(unsafe cast<ptr<const i64>>(block_weights.contents()), sequences / 2);
+    var mismatches: i64 = 0;
+    var nonzero: i64 = 0;
+    for 0..physical_rows |row| {
+        let expected = reference_row_sum(code_view, table_view, activation_view, block_weight_view, bits_per_step, physical_rows, sequences, row);
+        if sums[row] != expected {
+            mismatches = mismatches + 1;
+        }
+        if expected != 0 {
+            nonzero = nonzero + 1;
+        }
+    }
+    testing::expect_equal<i64>(0, mismatches);
+    testing::expect(nonzero > physical_rows / 2);
+    return;
+}
+
+test "the six-bit row sums kernel matches the cpu sums" {
+    try compare_row_sums(6, c"compressed_linear_row_sums_six");
+}
+
+test "the eight-bit row sums kernel matches the cpu sums" {
+    try compare_row_sums(8, c"compressed_linear_row_sums_eight");
+}
+
+fn half_bits_of(value: i8) -> u16 {
+    if value == 0 {
+        return 0;
+    }
+    var sign: i64 = 0;
+    var magnitude = cast<i64>(value);
+    if magnitude < 0 {
+        sign = 0x8000;
+        magnitude = -magnitude;
+    }
+    var exponent: i64 = 0;
+    while (magnitude >> (exponent + 1)) > 0 {
+        exponent = exponent + 1;
+    }
+    let mantissa = (magnitude << (10 - exponent)) & 0x3ff;
+    return cast<u16>(sign | ((exponent + 15) << 10) | mantissa);
+}
+
+fn compare_batch_row_sums(bits_per_step: i64, name: ptr<const u8>) -> !void {
+    let allocator = mem::page_allocator();
+    let source = try generated_source(allocator);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let kernel = try library.kernel(&gpu, name);
+    defer kernel.release();
+    let physical_rows: i64 = 128;
+    let sequences: i64 = 6;
+    let batch: i64 = 8;
+    let sum_stride: i64 = 256;
+    let code_count = sequences * (physical_rows / 32) * bits_per_step * 128;
+    let codes = try gpu.new_shared_buffer(cast<u64>(code_count * 4));
+    defer codes.release();
+    let weight_pairs = try gpu.new_shared_buffer(8192);
+    defer weight_pairs.release();
+    let halves = try gpu.new_shared_buffer(cast<u64>(sequences * 2048 * 2));
+    defer halves.release();
+    let block_weights = try gpu.new_shared_buffer(cast<u64>(sequences / 2 * 8 * 8));
+    defer block_weights.release();
+    let sums = try gpu.new_shared_buffer(cast<u64>(batch * sum_stride * 8));
+    defer sums.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    fill_bytes(&codes, code_count * 4, 21);
+    fill_bytes(&weight_pairs, 8192, 22);
+    fill_block_weights(&block_weights, sequences / 2 * 8, 23);
+    var random = rand::new(24);
+    var activation = [12288]i8{};
+    let activation_view = activation.as_mut_slice();
+    // SAFETY: the half buffer holds sequences * 2048 u16, and no GPU work uses it yet.
+    let half_view = unsafe mut_view_from_ptr(unsafe cast<ptr<u16>>(halves.contents()), sequences * 2048);
+    for 0..batch |token| {
+        for 0..(sequences * 256) |index| {
+            let value = cast<i8>(random.below(255) - 127);
+            activation_view[token * 1536 + index] = value;
+            half_view[((index / 256) * 8 + token) * 256 + index % 256] = half_bits_of(value);
+        }
+    }
+    // SAFETY: the status buffer holds one u32, and no GPU work uses it yet.
+    let status_words = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(status.contents()), 1);
+    status_words[0] = 0;
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &codes);
+    pass.bind_buffer(1, &weight_pairs);
+    pass.bind_buffer(2, &halves);
+    pass.bind_buffer(3, &block_weights);
+    pass.bind_buffer(4, &sums);
+    let shape = [4]i64{ physical_rows, sequences, batch, sum_stride };
+    let shape_view = shape.as_slice();
+    bind_values(&pass, 5, shape_view[0..1]);
+    bind_values(&pass, 6, shape_view[1..2]);
+    bind_values(&pass, 7, shape_view[2..3]);
+    bind_values(&pass, 8, shape_view[3..4]);
+    let lengths = [5]i64{ code_count, 4096, sequences * 1024, sequences / 2 * 8, batch * sum_stride };
+    let length_view = lengths.as_slice();
+    bind_values(&pass, 9, length_view);
+    pass.bind_buffer(10, &status);
+    pass.dispatch_threadgroups(&kernel, cast<u64>(physical_rows / 32), 128);
+    try pass.finish();
+    testing::expect_equal<u32>(0, status_words[0]);
+    // SAFETY: the pass finished, and each buffer holds the counts filled above.
+    let got = unsafe view_from_ptr(unsafe cast<ptr<const i64>>(sums.contents()), batch * sum_stride);
+    // SAFETY: as above.
+    let code_view = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(codes.contents()), code_count);
+    // SAFETY: as above.
+    let table_view = unsafe view_from_ptr(unsafe cast<ptr<const i8>>(weight_pairs.contents()), 8192);
+    // SAFETY: as above.
+    let weight_view = unsafe view_from_ptr(unsafe cast<ptr<const i64>>(block_weights.contents()), sequences / 2 * 8);
+    var mismatches: i64 = 0;
+    for 0..batch |token| {
+        var token_weights = [3]i64{};
+        let token_weight_view = token_weights.as_mut_slice();
+        for 0..(sequences / 2) |block| {
+            token_weight_view[block] = weight_view[block * 8 + token];
+        }
+        let token_activation = activation_view[token * 1536..token * 1536 + 1536];
+        for 0..physical_rows |row| {
+            let expected = reference_row_sum(code_view, table_view, token_activation, token_weight_view, bits_per_step, physical_rows, sequences, row);
+            if got[token * sum_stride + row] != expected {
+                mismatches = mismatches + 1;
+            }
+        }
+    }
+    testing::expect_equal<i64>(0, mismatches);
+    return;
+}
+
+test "the six-bit batch row sums kernel matches the cpu sums for every token" {
+    try compare_batch_row_sums(6, c"compressed_linear_row_sums_six_batch");
+}
+
+test "the eight-bit batch row sums kernel matches the cpu sums for every token" {
+    try compare_batch_row_sums(8, c"compressed_linear_row_sums_eight_batch");
+}

@@ -1,0 +1,402 @@
+import std::array;
+import std::fs;
+import std::io;
+import std::mem;
+import std::string;
+
+pub error TextError {
+    BadTables,
+    BadTokenizer,
+}
+
+pub fn class_letter() -> u8 {
+    return 1;
+}
+
+pub fn class_mark() -> u8 {
+    return 2;
+}
+
+pub fn class_number() -> u8 {
+    return 4;
+}
+
+pub fn class_space() -> u8 {
+    return 8;
+}
+
+fn replacement_point() -> u32 {
+    return 0xfffd;
+}
+
+/// values holds the sections of data/unicode_tables.bin; each pair of fields names one section.
+pub struct UnicodeTables {
+    values: array::Array<u32>,
+    ascii_classes: string::String,
+    letters: i64,
+    letters_count: i64,
+    marks: i64,
+    marks_count: i64,
+    numbers: i64,
+    numbers_count: i64,
+    spaces: i64,
+    spaces_count: i64,
+    combining: i64,
+    combining_count: i64,
+    decompositions: i64,
+    decompositions_count: i64,
+    pool: i64,
+    compositions: i64,
+    compositions_count: i64,
+}
+
+fn in_ranges(values: []u32, first: i64, count: i64, point: u32) -> bool {
+    var low: i64 = 0;
+    var high = count / 2;
+    while low < high {
+        let middle = (low + high) / 2;
+        if point < values[first + middle * 2] {
+            high = middle;
+        } else {
+            if point > values[first + middle * 2 + 1] {
+                low = middle + 1;
+            } else {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+pub fn load_unicode_tables(allocator: Allocator, path: []u8) -> !UnicodeTables {
+    let file = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer file.deinit(allocator);
+    let bytes = file.as_bytes();
+    var tables = UnicodeTables {
+        values: array::new<u32>(allocator),
+        ascii_classes: string::new(allocator),
+        letters: 0,
+        letters_count: 0,
+        marks: 0,
+        marks_count: 0,
+        numbers: 0,
+        numbers_count: 0,
+        spaces: 0,
+        spaces_count: 0,
+        combining: 0,
+        combining_count: 0,
+        decompositions: 0,
+        decompositions_count: 0,
+        pool: 0,
+        compositions: 0,
+        compositions_count: 0,
+    };
+    errdefer tables.deinit(allocator);
+    let word_count = mem::len(bytes) / 4;
+    try tables.values.reserve(allocator, word_count);
+    for 0..word_count |word| {
+        let at = word * 4;
+        try tables.values.append(allocator, cast<u32>(bytes[at]) | (cast<u32>(bytes[at + 1]) << 8) | (cast<u32>(bytes[at + 2]) << 16) | (cast<u32>(bytes[at + 3]) << 24));
+    }
+    try tables.index_sections();
+    for 0..128 |point| {
+        let class = tables.class_from_ranges(cast<u32>(point));
+        try tables.ascii_classes.append_byte(allocator, class);
+    }
+    return move tables;
+}
+
+fn (self: &var UnicodeTables) index_sections() -> TextError!void {
+    let view = self.values.as_slice();
+    let word_count = self.values.len();
+    if word_count < 10 or view[0] != 0x54584b5a or view[1] != 1 {
+        return TextError::BadTables;
+    }
+    var firsts = [8]i64{};
+    var counts = [8]i64{};
+    let first_view = firsts.as_mut_slice();
+    let count_view = counts.as_mut_slice();
+    var cursor: i64 = 2;
+    for 0..8 |section| {
+        if cursor >= word_count {
+            return TextError::BadTables;
+        }
+        count_view[section] = cast<i64>(view[cursor]);
+        first_view[section] = cursor + 1;
+        cursor = cursor + 1 + count_view[section];
+    }
+    if cursor != word_count {
+        return TextError::BadTables;
+    }
+    self.letters = first_view[0];
+    self.letters_count = count_view[0];
+    self.marks = first_view[1];
+    self.marks_count = count_view[1];
+    self.numbers = first_view[2];
+    self.numbers_count = count_view[2];
+    self.spaces = first_view[3];
+    self.spaces_count = count_view[3];
+    self.combining = first_view[4];
+    self.combining_count = count_view[4];
+    self.decompositions = first_view[5];
+    self.decompositions_count = count_view[5];
+    self.pool = first_view[6];
+    self.compositions = first_view[7];
+    self.compositions_count = count_view[7];
+    return;
+}
+
+fn (self: &UnicodeTables) class_from_ranges(point: u32) -> u8 {
+    let view = self.values.as_slice();
+    var class: u8 = 0;
+    if in_ranges(view, self.letters, self.letters_count, point) {
+        class = class | class_letter();
+    }
+    if in_ranges(view, self.marks, self.marks_count, point) {
+        class = class | class_mark();
+    }
+    if in_ranges(view, self.numbers, self.numbers_count, point) {
+        class = class | class_number();
+    }
+    if in_ranges(view, self.spaces, self.spaces_count, point) {
+        class = class | class_space();
+    }
+    return class;
+}
+
+pub fn (self: UnicodeTables) deinit(allocator: Allocator) -> void {
+    self.ascii_classes.deinit(allocator);
+    self.values.deinit(allocator);
+    return;
+}
+
+pub fn (self: &UnicodeTables) class_of(point: u32) -> u8 {
+    if point < 128 {
+        let classes = self.ascii_classes.as_bytes();
+        return classes[cast<i64>(point)];
+    }
+    return self.class_from_ranges(point);
+}
+
+fn (self: &UnicodeTables) combining_class(point: u32) -> u32 {
+    if point < 0x300 {
+        return 0;
+    }
+    let view = self.values.as_slice();
+    var low: i64 = 0;
+    var high = self.combining_count / 3;
+    while low < high {
+        let middle = (low + high) / 2;
+        let at = self.combining + middle * 3;
+        if point < view[at] {
+            high = middle;
+        } else {
+            if point > view[at + 1] {
+                low = middle + 1;
+            } else {
+                return view[at + 2];
+            }
+        }
+    }
+    return 0;
+}
+
+fn (self: &UnicodeTables) decomposition_at(point: u32) -> i64 {
+    let view = self.values.as_slice();
+    var low: i64 = 0;
+    var high = self.decompositions_count / 3;
+    while low < high {
+        let middle = (low + high) / 2;
+        let at = self.decompositions + middle * 3;
+        if point < view[at] {
+            high = middle;
+        } else {
+            if point > view[at] {
+                low = middle + 1;
+            } else {
+                return at;
+            }
+        }
+    }
+    return -1;
+}
+
+fn (self: &UnicodeTables) composed(first: u32, second: u32) -> u32 {
+    if first >= 0x1100 and first < 0x1113 and second >= 0x1161 and second < 0x1176 {
+        return 0xac00 + ((first - 0x1100) * 21 + (second - 0x1161)) * 28;
+    }
+    if first >= 0xac00 and first <= 0xd7a3 and (first - 0xac00) % 28 == 0 and second > 0x11a7 and second < 0x11c3 {
+        return first + (second - 0x11a7);
+    }
+    let view = self.values.as_slice();
+    var low: i64 = 0;
+    var high = self.compositions_count / 3;
+    while low < high {
+        let middle = (low + high) / 2;
+        let at = self.compositions + middle * 3;
+        if first < view[at] or (first == view[at] and second < view[at + 1]) {
+            high = middle;
+        } else {
+            if first == view[at] and second == view[at + 1] {
+                return view[at + 2];
+            }
+            low = middle + 1;
+        }
+    }
+    return 0;
+}
+
+fn continuation(bytes: []u8, at: i64) -> bool {
+    return at < mem::len(bytes) and (bytes[at] & 0xc0) == 0x80;
+}
+
+/// Returns the code point at index in the low 32 bits and its byte length above them; bad bytes read as U+FFFD, one byte long.
+pub fn decode_point(bytes: []u8, index: i64) -> u64 {
+    let first = cast<u32>(bytes[index]);
+    var point = replacement_point();
+    var length: u64 = 1;
+    if first < 0x80 {
+        point = first;
+    } else {
+        if first >= 0xc2 and first < 0xe0 and continuation(bytes, index + 1) {
+            point = ((first & 0x1f) << 6) | (cast<u32>(bytes[index + 1]) & 0x3f);
+            length = 2;
+        } else {
+            if first >= 0xe0 and first < 0xf0 and continuation(bytes, index + 1) and continuation(bytes, index + 2) {
+                let value = ((first & 0x0f) << 12) | ((cast<u32>(bytes[index + 1]) & 0x3f) << 6) | (cast<u32>(bytes[index + 2]) & 0x3f);
+                if value >= 0x800 and (value < 0xd800 or value > 0xdfff) {
+                    point = value;
+                    length = 3;
+                }
+            } else {
+                if first >= 0xf0 and first < 0xf5 and continuation(bytes, index + 1) and continuation(bytes, index + 2) and continuation(bytes, index + 3) {
+                    let value = ((first & 0x07) << 18) | ((cast<u32>(bytes[index + 1]) & 0x3f) << 12) | ((cast<u32>(bytes[index + 2]) & 0x3f) << 6) | (cast<u32>(bytes[index + 3]) & 0x3f);
+                    if value >= 0x10000 and value <= 0x10ffff {
+                        point = value;
+                        length = 4;
+                    }
+                }
+            }
+        }
+    }
+    return cast<u64>(point) | (length << 32);
+}
+
+pub fn append_point(allocator: Allocator, point: u32, out: &var string::String) -> mem::Error!void {
+    if point < 0x80 {
+        try out.append_byte(allocator, cast<u8>(point));
+        return;
+    }
+    if point < 0x800 {
+        try out.append_byte(allocator, cast<u8>(0xc0 | (point >> 6)));
+        try out.append_byte(allocator, cast<u8>(0x80 | (point & 0x3f)));
+        return;
+    }
+    if point < 0x10000 {
+        try out.append_byte(allocator, cast<u8>(0xe0 | (point >> 12)));
+        try out.append_byte(allocator, cast<u8>(0x80 | ((point >> 6) & 0x3f)));
+        try out.append_byte(allocator, cast<u8>(0x80 | (point & 0x3f)));
+        return;
+    }
+    try out.append_byte(allocator, cast<u8>(0xf0 | (point >> 18)));
+    try out.append_byte(allocator, cast<u8>(0x80 | ((point >> 12) & 0x3f)));
+    try out.append_byte(allocator, cast<u8>(0x80 | ((point >> 6) & 0x3f)));
+    try out.append_byte(allocator, cast<u8>(0x80 | (point & 0x3f)));
+    return;
+}
+
+fn (self: &UnicodeTables) append_decomposed(allocator: Allocator, point: u32, points: &var array::Array<u32>, classes: &var array::Array<u32>) -> mem::Error!void {
+    if point >= 0xac00 and point <= 0xd7a3 {
+        let syllable = point - 0xac00;
+        try points.append(allocator, 0x1100 + syllable / 588);
+        try classes.append(allocator, 0);
+        try points.append(allocator, 0x1161 + (syllable % 588) / 28);
+        try classes.append(allocator, 0);
+        if syllable % 28 != 0 {
+            try points.append(allocator, 0x11a7 + syllable % 28);
+            try classes.append(allocator, 0);
+        }
+        return;
+    }
+    let at = self.decomposition_at(point);
+    if at < 0 {
+        try points.append(allocator, point);
+        try classes.append(allocator, self.combining_class(point));
+        return;
+    }
+    let view = self.values.as_slice();
+    let first = self.pool + cast<i64>(view[at + 1]);
+    for 0..cast<i64>(view[at + 2]) |offset| {
+        let part = view[first + offset];
+        try points.append(allocator, part);
+        try classes.append(allocator, self.combining_class(part));
+    }
+    return;
+}
+
+/// Appends the canonical composition of text to out.
+pub fn (self: &UnicodeTables) normalize_nfc(allocator: Allocator, text: []u8, out: &var string::String) -> mem::Error!void {
+    let count = mem::len(text);
+    var plain = true;
+    for 0..count |index| {
+        if text[index] >= 0x80 {
+            plain = false;
+        }
+    }
+    if plain {
+        for 0..count |index| {
+            try out.append_byte(allocator, text[index]);
+        }
+        return;
+    }
+    var points = array::new<u32>(allocator);
+    defer points.deinit(allocator);
+    var classes = array::new<u32>(allocator);
+    defer classes.deinit(allocator);
+    var index: i64 = 0;
+    while index < count {
+        let decoded = decode_point(text, index);
+        try self.append_decomposed(allocator, cast<u32>(decoded & 0xffffffff), &var points, &var classes);
+        index = index + cast<i64>(decoded >> 32);
+    }
+    let total = points.len();
+    let point_view = points.as_mut_slice();
+    let class_view = classes.as_mut_slice();
+    for 1..total |at| {
+        var moving = at;
+        while moving > 0 and class_view[moving] != 0 and class_view[moving - 1] > class_view[moving] {
+            let point = point_view[moving];
+            let class = class_view[moving];
+            point_view[moving] = point_view[moving - 1];
+            class_view[moving] = class_view[moving - 1];
+            point_view[moving - 1] = point;
+            class_view[moving - 1] = class;
+            moving = moving - 1;
+        }
+    }
+    var written: i64 = 0;
+    var starter: i64 = -1;
+    var last_class: u32 = 0;
+    for 0..total |at| {
+        let point = point_view[at];
+        let class = class_view[at];
+        var merged: u32 = 0;
+        if starter >= 0 and (written - 1 == starter or last_class < class) {
+            merged = self.composed(point_view[starter], point);
+        }
+        if merged != 0 {
+            point_view[starter] = merged;
+        } else {
+            if class == 0 {
+                starter = written;
+            }
+            last_class = class;
+            point_view[written] = point;
+            written = written + 1;
+        }
+    }
+    for 0..written |at| {
+        try append_point(allocator, point_view[at], out);
+    }
+    return;
+}

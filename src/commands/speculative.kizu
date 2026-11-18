@@ -1,0 +1,390 @@
+import kizukani::mapped;
+import kizukani::model;
+import kizukani::text;
+import kizukani::yskn;
+import std::array;
+import std::fs;
+import std::io;
+import std::mem;
+import std::process;
+
+pub enum DraftMode {
+    None,
+    Ngram,
+    Oracle,
+    Neural,
+    Both,
+}
+
+struct NoDraft {
+    unused: i64,
+}
+
+fn (self: &NoDraft) push_context(decoder: &model::GpuDecoder, position: i64, rows: i64) -> !void {
+    return;
+}
+
+fn (self: &NoDraft) propose(decoder: &model::GpuDecoder, draft_file: []u8, frontier_embedding: []f32, mask_embedding: []f32, frontier: i64, position: i64, context_rows: i64, out: &var []i64) -> !void {
+    return;
+}
+
+fn draft_path() -> ptr<const u8> {
+    return c"models/qwen38-27b-speed/bdraft2_k8.yskn";
+}
+
+fn head_path() -> ptr<const u8> {
+    return c"models/qwen38-27b-speed/bdraft2_k8.shead";
+}
+
+fn ngram_drafts(allocator: Allocator, history: []i64, limit: i64, out: &var array::Array<i64>) -> mem::Error!void {
+    let count = mem::count<i64>(history);
+    var length: i64 = 3;
+    while length >= 1 {
+        if count > length {
+            var start = count - length - 1;
+            while start >= 0 {
+                var same = true;
+                for 0..length |offset| {
+                    if history[start + offset] != history[count - length + offset] {
+                        same = false;
+                    }
+                }
+                if same {
+                    var next = start + length;
+                    while next < count and out.len() < limit {
+                        try out.append(allocator, history[next]);
+                        next = next + 1;
+                    }
+                    return;
+                }
+                start = start - 1;
+            }
+        }
+        length = length - 1;
+    }
+    return;
+}
+
+fn long_ngram_length() -> i64 {
+    return 6;
+}
+
+/// Copies what followed the latest earlier match of the last 3 tokens, when that match extends back to long_ngram_length() tokens.
+fn long_ngram_drafts(allocator: Allocator, history: []i64, limit: i64, out: &var array::Array<i64>) -> mem::Error!void {
+    let count = mem::count<i64>(history);
+    if count < 3 {
+        return;
+    }
+    let suffix = count - 3;
+    var start = suffix - 1;
+    while start >= 0 {
+        if history[start] == history[suffix] and history[start + 1] == history[suffix + 1] and history[start + 2] == history[suffix + 2] {
+            var matched: i64 = 3;
+            var back: i64 = 1;
+            while back <= start and matched < long_ngram_length() and history[start - back] == history[suffix - back] {
+                matched = matched + 1;
+                back = back + 1;
+            }
+            if matched < long_ngram_length() {
+                return;
+            }
+            var next = start + 3;
+            while next < count and out.len() < limit {
+                try out.append(allocator, history[next]);
+                next = next + 1;
+            }
+            return;
+        }
+        start = start - 1;
+    }
+    return;
+}
+
+fn neural_drafts<R>(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &model::ModelWeights, decoder: &model::GpuDecoder, draft: &R, draft_file: []u8, mask_view: []f32, frontier: i64, position: i64, context_rows: i64, limit: i64, out: &var array::Array<i64>) -> !void {
+    let frontier_embedding = try model::embed_token(allocator, file, header, weights, frontier);
+    defer frontier_embedding.deinit(allocator);
+    let frontier_view = frontier_embedding.as_slice();
+    var proposed = [7]i64{};
+    let proposed_view = proposed.as_mut_slice();
+    try draft.propose(decoder, draft_file, frontier_view, mask_view, frontier, position, context_rows, &var proposed_view);
+    for 0..limit |index| {
+        try out.append(allocator, proposed_view[index]);
+    }
+    return;
+}
+
+fn oracle_drafts(allocator: Allocator, expected: []i64, done: i64, limit: i64, out: &var array::Array<i64>) -> mem::Error!void {
+    var index = done;
+    while index < mem::count<i64>(expected) and out.len() < limit {
+        var token = expected[index];
+        if index % 5 == 3 {
+            token = token + 1;
+        }
+        try out.append(allocator, token);
+        index = index + 1;
+    }
+    return;
+}
+
+fn append_embedding(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &model::ModelWeights, token: i64, out: &var array::Array<f32>) -> !void {
+    let embedding = try model::embed_token(allocator, file, header, weights, token);
+    defer embedding.deinit(allocator);
+    let view = embedding.as_slice();
+    for 0..mem::count<f32>(view) |index| {
+        try out.append(allocator, view[index]);
+    }
+    return;
+}
+
+/// Feeds prompt[0..count-1] in batches and returns with prompt[count-1] as the uncommitted frontier.
+/// Runs every token but the last through the model from start, leaving the last as the next input.
+fn prefill<R>(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &model::ModelWeights, decoder: &model::GpuDecoder, tokens: []i64, start: i64, draft: &R) -> !void {
+    let count = mem::count<i64>(tokens) - 1;
+    var done: i64 = 0;
+    while done < count {
+        var batch = count - done;
+        if batch > model::decode_batch_capacity() {
+            batch = model::decode_batch_capacity();
+        }
+        var embeddings = array::new<f32>(allocator);
+        defer embeddings.deinit(allocator);
+        for 0..batch |offset| {
+            try append_embedding(allocator, file, header, weights, tokens[done + offset], &var embeddings);
+        }
+        let embedding_view = embeddings.as_slice();
+        try decoder.run_batch(weights, embedding_view, start + done, batch);
+        try draft.push_context(decoder, start + done, batch);
+        decoder.commit_tokens(batch);
+        done = done + batch;
+    }
+    return;
+}
+
+/// Where decoding stands between passes, with the time it has spent so far.
+struct DecodeCursor {
+    frontier: i64,
+    position: i64,
+    context_rows: i64,
+    passes: i64,
+    draft_milliseconds: i64,
+    verify_milliseconds: i64,
+}
+
+fn is_end_token(token: i64) -> bool {
+    return token == text::token_turn_end() or token == text::token_text_end();
+}
+
+/// Verifies one batch of guesses and appends the confirmed tokens to out; answers whether an end token was confirmed.
+fn decode_pass<R>(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &model::ModelWeights, decoder: &model::GpuDecoder, draft: &R, draft_file: []u8, mask_view: []f32, mode: DraftMode, expected: []i64, room: i64, stop_at_end: bool, history: &var array::Array<i64>, out: &var array::Array<i64>, cursor: &var DecodeCursor) -> !bool {
+    let frontier = cursor.frontier;
+    let position = cursor.position;
+    let context_rows = cursor.context_rows;
+    var drafts = array::new<i64>(allocator);
+    defer drafts.deinit(allocator);
+    var limit = model::decode_batch_capacity() - 1;
+    if room < limit {
+        limit = room;
+    }
+    if limit > 0 {
+        match mode {
+            Ngram => {
+                let history_view = history.as_slice();
+                try ngram_drafts(allocator, history_view, limit, &var drafts);
+            },
+            Oracle => try oracle_drafts(allocator, expected, out.len(), limit, &var drafts),
+            Neural => {
+                let started = process::unix_millis();
+                try neural_drafts<R>(allocator, file, header, weights, decoder, draft, draft_file, mask_view, frontier, position, context_rows, limit, &var drafts);
+                cursor.draft_milliseconds = cursor.draft_milliseconds + process::unix_millis() - started;
+            },
+            Both => {
+                let history_view = history.as_slice();
+                try long_ngram_drafts(allocator, history_view, limit, &var drafts);
+                let started = process::unix_millis();
+                if drafts.len() == 0 {
+                    try neural_drafts<R>(allocator, file, header, weights, decoder, draft, draft_file, mask_view, frontier, position, context_rows, limit, &var drafts);
+                } else {
+                    if context_rows > 0 {
+                        try draft.push_context(decoder, position - context_rows, context_rows);
+                    }
+                }
+                cursor.draft_milliseconds = cursor.draft_milliseconds + process::unix_millis() - started;
+            },
+            None => {},
+        }
+    }
+    var embeddings = array::new<f32>(allocator);
+    defer embeddings.deinit(allocator);
+    try append_embedding(allocator, file, header, weights, frontier, &var embeddings);
+    let draft_view = drafts.as_slice();
+    for 0..drafts.len() |index| {
+        try append_embedding(allocator, file, header, weights, draft_view[index], &var embeddings);
+    }
+    let count = 1 + drafts.len();
+    let embedding_view = embeddings.as_slice();
+    let verify_started = process::unix_millis();
+    try decoder.run_batch(weights, embedding_view, position, count);
+    cursor.verify_milliseconds = cursor.verify_milliseconds + process::unix_millis() - verify_started;
+    cursor.passes = cursor.passes + 1;
+    var accepted: i64 = 0;
+    var next = decoder.greedy_at(weights, 0);
+    while accepted < drafts.len() and draft_view[accepted] == next and !(stop_at_end and is_end_token(next)) {
+        try out.append(allocator, next);
+        try history.append(allocator, next);
+        accepted = accepted + 1;
+        next = decoder.greedy_at(weights, accepted);
+    }
+    try out.append(allocator, next);
+    try history.append(allocator, next);
+    cursor.context_rows = accepted + 1;
+    decoder.commit_tokens(accepted + 1);
+    cursor.position = position + accepted + 1;
+    cursor.frontier = next;
+    return stop_at_end and is_end_token(next);
+}
+
+fn generate<R>(allocator: Allocator, file: []u8, header: &yskn::ContainerHeader, weights: &model::ModelWeights, decoder: &model::GpuDecoder, draft: &R, draft_file: []u8, prompt: []i64, generated_count: i64, mode: DraftMode, expected: []i64, out: &var array::Array<i64>) -> !i64 {
+    let prefill_started = process::unix_millis();
+    try prefill<R>(allocator, file, header, weights, decoder, prompt, 0, draft);
+    print("prefill milliseconds:");
+    print(process::unix_millis() - prefill_started);
+    let mask = try model::embed_token(allocator, file, header, weights, model::draft_mask_token());
+    defer mask.deinit(allocator);
+    let mask_view = mask.as_slice();
+    let generation_started = process::unix_millis();
+    var history = array::new<i64>(allocator);
+    defer history.deinit(allocator);
+    for 0..mem::count<i64>(prompt) |index| {
+        try history.append(allocator, prompt[index]);
+    }
+    var cursor = DecodeCursor {
+        frontier: prompt[mem::count<i64>(prompt) - 1],
+        position: mem::count<i64>(prompt) - 1,
+        context_rows: 0,
+        passes: 0,
+        draft_milliseconds: 0,
+        verify_milliseconds: 0,
+    };
+    while out.len() < generated_count {
+        let room = generated_count - out.len() - 1;
+        let stopped = try decode_pass<R>(allocator, file, header, weights, decoder, draft, draft_file, mask_view, mode, expected, room, false, &var history, out, &var cursor);
+        if stopped {
+            break;
+        }
+    }
+    print("generation milliseconds:");
+    print(process::unix_millis() - generation_started);
+    print("draft milliseconds, verify milliseconds:");
+    print(cursor.draft_milliseconds);
+    print(cursor.verify_milliseconds);
+    return cursor.passes;
+}
+
+pub fn run_speculative_selfcheck(mode: DraftMode, generated_count: i64) -> !void {
+    let prompt = [5]i64{ 760, 6511, 314, 9338, 369 };
+    let expected = [12]i64{ 11751, 13, 198, 760, 6511, 314, 9564, 369, 19241, 13, 198, 760 };
+    let prompt_view = prompt.as_slice();
+    let expected_view = expected.as_slice();
+    try run_speculative(mode, generated_count, prompt_view, expected_view, false);
+    return;
+}
+
+/// Generates count tokens greedily after the whitespace-separated token ids in the file at path.
+pub fn run_speculative_task(mode: DraftMode, generated_count: i64, path: []u8, quality: bool) -> !void {
+    let allocator = mem::page_allocator();
+    let text = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer text.deinit(allocator);
+    let bytes = text.as_bytes();
+    var prompt = array::new<i64>(allocator);
+    defer prompt.deinit(allocator);
+    var value: i64 = 0;
+    var inside = false;
+    for 0..mem::len(bytes) |index| {
+        let digit = cast<i64>(bytes[index]) - 48;
+        if digit >= 0 and digit <= 9 {
+            value = value * 10 + digit;
+            inside = true;
+        } else {
+            if inside {
+                try prompt.append(allocator, value);
+            }
+            value = 0;
+            inside = false;
+        }
+    }
+    if inside {
+        try prompt.append(allocator, value);
+    }
+    let prompt_view = prompt.as_slice();
+    let no_expected = array::new<i64>(allocator);
+    defer no_expected.deinit(allocator);
+    let expected_view = no_expected.as_slice();
+    try run_speculative(mode, generated_count, prompt_view, expected_view, quality);
+    return;
+}
+
+fn run_speculative(mode: DraftMode, generated_count: i64, prompt_view: []i64, expected_view: []i64, quality: bool) -> !void {
+    let allocator = mem::page_allocator();
+    let mapping = try mapped::map_read_only(chat_weights_path(quality));
+    defer mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let file = unsafe view_from_ptr(mapping.first_byte(), mapping.length());
+    // SAFETY: reading an address as an integer touches no memory.
+    let file_address = cast<u64>(unsafe int_from_ptr<usize>(mapping.first_byte()));
+    let header = try yskn::read_container_header(allocator, file);
+    defer header.deinit(allocator);
+    let weights = try model::load_model_weights(allocator, file, file_address, &header, 64);
+    defer weights.deinit(allocator);
+    // SAFETY: the decoder is released before the mapping.
+    let decoder = try unsafe model::open_gpu_decoder(allocator, &weights, file_address, cast<u64>(mapping.length()), model::decode_maximum_positions());
+    defer decoder.deinit(allocator);
+    var out = array::new<i64>(allocator);
+    defer out.deinit(allocator);
+    let draft_mapping = try mapped::map_read_only(draft_path());
+    defer draft_mapping.release();
+    // SAFETY: the mapping holds length() bytes until release at the end of this function.
+    let draft_file = unsafe view_from_ptr(draft_mapping.first_byte(), draft_mapping.length());
+    let head_mapping = try mapped::map_read_only(head_path());
+    defer head_mapping.release();
+    let started = process::unix_millis();
+    var passes: i64 = 0;
+    if mode == DraftMode::Neural or mode == DraftMode::Both {
+        // SAFETY: reading an address as an integer touches no memory.
+        let draft_address = cast<u64>(unsafe int_from_ptr<usize>(draft_mapping.first_byte()));
+        // SAFETY: as above.
+        let head_address = cast<u64>(unsafe int_from_ptr<usize>(head_mapping.first_byte()));
+        // SAFETY: both mappings outlive the draft, which is released first.
+        let draft = try unsafe model::open_gpu_draft(allocator, &decoder, draft_file, draft_address, head_address, cast<u64>(head_mapping.length()));
+        defer draft.deinit(allocator);
+        passes = try generate<model::GpuDraft>(allocator, file, &header, &weights, &decoder, &draft, draft_file, prompt_view, generated_count, mode, expected_view, &var out);
+    } else {
+        let draft = NoDraft { unused: 0 };
+        passes = try generate<NoDraft>(allocator, file, &header, &weights, &decoder, &draft, draft_file, prompt_view, generated_count, mode, expected_view, &var out);
+    }
+    let elapsed = process::unix_millis() - started;
+    let out_view = out.as_slice();
+    var matched: i64 = 0;
+    for 0..mem::count<i64>(expected_view) |index| {
+        if index < out.len() and out_view[index] == expected_view[index] {
+            matched = matched + 1;
+        }
+    }
+    var output_hash: i64 = 0;
+    for 0..out.len() |index| {
+        output_hash = (output_hash * 31 + out_view[index]) % 1000000007;
+    }
+    if mem::count<i64>(expected_view) == 0 {
+        print("generated ids:");
+        for 0..out.len() |index| {
+            print(out_view[index]);
+        }
+    }
+    print("output hash:");
+    print(output_hash);
+    print("matched of expected, generated, passes, milliseconds per generated token:");
+    print(matched);
+    print(out.len());
+    print(passes);
+    print(elapsed / out.len());
+    return;
+}

@@ -1,0 +1,130 @@
+import std::math;
+import std::rand;
+import std::testing;
+
+fn expect_compile_error(source: []u8, name: ptr<const u8>, expected: MetalError) -> MetalError!void {
+    let gpu = try open_default_gpu();
+    defer gpu.release();
+    if gpu.compile_kernel(source, name) |kernel| {
+        kernel.release();
+        testing::fail("compile succeeded");
+    } else |failure| {
+        testing::expect_equal<MetalError>(expected, failure);
+    }
+    return;
+}
+
+test "source that does not compile is CompileFailed" {
+    try expect_compile_error("kernel void broken( {", c"broken", MetalError::CompileFailed);
+}
+
+test "a function the source lacks is NoFunction" {
+    try expect_compile_error("kernel void present(device uint *x [[buffer(0)]]) {}", c"absent", MetalError::NoFunction);
+}
+
+test "two dispatches in one pass run in order" {
+    let gpu = try open_default_gpu();
+    defer gpu.release();
+    let source =
+        \\kernel void bump(device uint *x [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+        \\    x[i] = x[i] * 2 + 1;
+        \\}
+    ;
+    let kernel = try gpu.compile_kernel(source, c"bump");
+    defer kernel.release();
+    let count: i64 = 100;
+    let buffer = try gpu.new_shared_buffer(cast<u64>(count * 4));
+    defer buffer.release();
+    // SAFETY: the buffer holds count u32.
+    let cells = unsafe cast<ptr<u32>>(buffer.contents());
+    // SAFETY: as above, and no GPU work uses it yet.
+    let values = unsafe mut_view_from_ptr(cells, count);
+    for 0..count |i| {
+        values[i] = cast<u32>(i);
+    }
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &buffer);
+    pass.dispatch_threads(&kernel, cast<u64>(count));
+    pass.dispatch_threads(&kernel, cast<u64>(count));
+    try pass.finish();
+    for 0..count |i| {
+        testing::expect_equal<u32>(cast<u32>(i * 4 + 3), values[i]);
+    }
+}
+
+fn gpu_float_results_match_cpu(operation_count: i64) -> MetalError![4]i64 {
+    let gpu = try open_default_gpu();
+    defer gpu.release();
+    let source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\#pragma METAL fp contract(off)
+        \\kernel void float_operations(device const float *a [[buffer(0)]],
+        \\                             device const float *b [[buffer(1)]],
+        \\                             device const float *c [[buffer(2)]],
+        \\                             device float *out [[buffer(3)]],
+        \\                             uint i [[thread_position_in_grid]]) {
+        \\    out[4 * i] = a[i] * b[i] + c[i];
+        \\    out[4 * i + 1] = a[i] / b[i];
+        \\    out[4 * i + 2] = sqrt(fabs(a[i]));
+        \\    out[4 * i + 3] = 1.0f / sqrt(fabs(a[i]));
+        \\}
+    ;
+    let kernel = try gpu.compile_kernel(source, c"float_operations");
+    defer kernel.release();
+    let a = try gpu.new_shared_buffer(cast<u64>(operation_count * 4));
+    defer a.release();
+    let b = try gpu.new_shared_buffer(cast<u64>(operation_count * 4));
+    defer b.release();
+    let c = try gpu.new_shared_buffer(cast<u64>(operation_count * 4));
+    defer c.release();
+    let out = try gpu.new_shared_buffer(cast<u64>(operation_count * 16));
+    defer out.release();
+    // SAFETY: each buffer holds the counts below, and no GPU work uses them yet.
+    let a_view = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(a.contents()), operation_count);
+    // SAFETY: as above.
+    let b_view = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(b.contents()), operation_count);
+    // SAFETY: as above.
+    let c_view = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(c.contents()), operation_count);
+    var random = rand::new(11);
+    for 0..operation_count |i| {
+        a_view[i] = cast<f32>(random.below(2000001) - 1000000) / cast<f32>(7919.0);
+        b_view[i] = cast<f32>(random.below(2000001) - 1000000) / cast<f32>(104729.0) + cast<f32>(0.5);
+        c_view[i] = cast<f32>(random.below(2000001) - 1000000) / cast<f32>(13.0);
+    }
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &a);
+    pass.bind_buffer(1, &b);
+    pass.bind_buffer(2, &c);
+    pass.bind_buffer(3, &out);
+    pass.dispatch_threads(&kernel, cast<u64>(operation_count));
+    try pass.finish();
+    // SAFETY: the pass finished and out holds four results per operation.
+    let out_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(out.contents()), operation_count * 4);
+    var mismatches = [4]i64{ 0, 0, 0, 0 };
+    let mismatch_view = mismatches.as_mut_slice();
+    for 0..operation_count |i| {
+        if out_view[4 * i] != a_view[i] * b_view[i] + c_view[i] {
+            mismatch_view[0] = mismatch_view[0] + 1;
+        }
+        if out_view[4 * i + 1] != a_view[i] / b_view[i] {
+            mismatch_view[1] = mismatch_view[1] + 1;
+        }
+        if out_view[4 * i + 2] != math::sqrt<f32>(math::abs<f32>(a_view[i])) {
+            mismatch_view[2] = mismatch_view[2] + 1;
+        }
+        if out_view[4 * i + 3] != cast<f32>(1.0) / math::sqrt<f32>(math::abs<f32>(a_view[i])) {
+            mismatch_view[3] = mismatch_view[3] + 1;
+        }
+    }
+    return mismatches;
+}
+
+test "gpu float arithmetic without fast math matches the cpu bit for bit" {
+    let mismatches = try gpu_float_results_match_cpu(100000);
+    let view = mismatches.as_slice();
+    testing::expect_equal<i64>(0, view[0]);
+    testing::expect_equal<i64>(0, view[1]);
+    testing::expect_equal<i64>(0, view[2]);
+    testing::expect_equal<i64>(0, view[3]);
+}

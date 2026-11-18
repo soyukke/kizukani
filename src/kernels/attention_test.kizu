@@ -1,0 +1,135 @@
+import kizukani::metal;
+import std::float;
+import std::math;
+import std::mem;
+import std::rand;
+import std::testing;
+
+fn fill_moderate(buffer: &metal::Buffer, count: i64, seed: i64) -> void {
+    // SAFETY: the buffer holds count f32, and no GPU work uses it yet.
+    let values = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(buffer.contents()), count);
+    var random = rand::new(seed);
+    for 0..count |index| {
+        values[index] = cast<f32>(random.below(8000001) - 4000000) / cast<f32>(1000003.0);
+    }
+    return;
+}
+
+fn key_mismatches(keys: &metal::Buffer, values: &metal::Buffer, norm: &metal::Buffer, rotary: &metal::Buffer, key_cache: &metal::Buffer, value_cache: &metal::Buffer, position: i64, cache_first: i64) -> i64 {
+    let width: i64 = 1024;
+    let cache_count = cache_first + (position + 1) * width;
+    // SAFETY: the pass finished, and the buffer holds width f32.
+    let key_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(keys.contents()), width);
+    // SAFETY: the pass finished, and the buffer holds width f32.
+    let value_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(values.contents()), width);
+    // SAFETY: the pass finished, and the buffer holds 256 f32.
+    let norm_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(norm.contents()), 256);
+    // SAFETY: the pass finished, and the buffer holds 64 f32.
+    let rotary_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(rotary.contents()), 64);
+    // SAFETY: the pass finished, and the buffer holds cache_count u32.
+    let got_keys = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(key_cache.contents()), cache_count);
+    // SAFETY: the pass finished, and the buffer holds cache_count u32.
+    let got_values = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(value_cache.contents()), cache_count);
+    var mismatches: i64 = 0;
+    var head = [256]f32{};
+    var head_view = head.as_mut_slice();
+    var lanes = [32]f32{};
+    let lane_view = lanes.as_mut_slice();
+    for 0..4 |head_index| {
+        var square_sum: f32 = 0.0;
+        for 0..8 |simdgroup| {
+            for 0..32 |lane| {
+                let value = round_to_bf16(key_view[head_index * 256 + simdgroup * 32 + lane]);
+                lane_view[lane] = value * value;
+            }
+            square_sum = square_sum + lane_sum(lane_view);
+        }
+        let inverse_rms = one() / math::sqrt<f32>(square_sum / cast<f32>(256) + model_epsilon());
+        for 0..256 |channel| {
+            let value = round_to_bf16(key_view[head_index * 256 + channel]);
+            head_view[channel] = round_to_bf16((value * inverse_rms) * (one() + norm_view[channel]));
+        }
+        for 0..256 |channel| {
+            var result = head_view[channel];
+            if channel < 32 {
+                result = round_to_bf16(round_to_bf16(head_view[channel] * rotary_view[channel]) + round_to_bf16(-head_view[channel + 32] * rotary_view[32 + channel]));
+            } else {
+                if channel < 64 {
+                    let pair = channel - 32;
+                    result = round_to_bf16(round_to_bf16(head_view[channel] * rotary_view[pair]) + round_to_bf16(head_view[pair] * rotary_view[32 + pair]));
+                }
+            }
+            let index = head_index * 256 + channel;
+            let cached = cache_first + position * width + index;
+            if !same_float_bits(got_keys[cached], float::bits_f32(result)) {
+                mismatches = mismatches + 1;
+            }
+            if !same_float_bits(got_values[cached], float::bits_f32(round_to_bf16(value_view[index]))) {
+                mismatches = mismatches + 1;
+            }
+        }
+    }
+    return mismatches;
+}
+
+test "the attention_keys kernel matches the cpu normalization bit for bit" {
+    let allocator = mem::page_allocator();
+    let source = try generated_kernel_source(allocator);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let generated = try library.kernel(&gpu, c"attention_keys");
+    defer generated.release();
+
+    let width: i64 = 1024;
+    let position: i64 = 3;
+    let cache_first: i64 = 512;
+    let cache_count = cache_first + (position + 1) * width;
+    let keys = try gpu.new_shared_buffer(cast<u64>(width * 4));
+    defer keys.release();
+    let values = try gpu.new_shared_buffer(cast<u64>(width * 4));
+    defer values.release();
+    let norm = try gpu.new_shared_buffer(1024);
+    defer norm.release();
+    let rotary = try gpu.new_shared_buffer(256);
+    defer rotary.release();
+    let key_cache_generated = try gpu.new_shared_buffer(cast<u64>(cache_count * 4));
+    defer key_cache_generated.release();
+    let value_cache_generated = try gpu.new_shared_buffer(cast<u64>(cache_count * 4));
+    defer value_cache_generated.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    fill_moderate(&keys, width, 31);
+    fill_moderate(&values, width, 32);
+    fill_moderate(&norm, 256, 33);
+    fill_moderate(&rotary, 64, 34);
+    fill_moderate(&key_cache_generated, cache_count, 35);
+    fill_moderate(&value_cache_generated, cache_count, 36);
+    clear_status(&status);
+
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &keys);
+    pass.bind_buffer(1, &values);
+    pass.bind_buffer(2, &norm);
+    pass.bind_buffer(3, &rotary);
+    pass.bind_buffer(4, &key_cache_generated);
+    pass.bind_buffer(5, &value_cache_generated);
+    let position_words = [1]i64{ position };
+    let position_view = position_words.as_slice();
+    bind_i64_values(&pass, 6, position_view);
+    let first_words = [1]i64{ cache_first };
+    let first_view = first_words.as_slice();
+    bind_i64_values(&pass, 7, first_view);
+    let lengths = [6]i64{ width, width, 256, 64, cache_count, cache_count };
+    let length_view = lengths.as_slice();
+    bind_i64_values(&pass, 8, length_view);
+    pass.bind_buffer(9, &status);
+    pass.dispatch_threadgroups(&generated, 4, 256);
+    try pass.finish();
+
+    testing::expect_equal<u32>(0, status_word(&status));
+    testing::expect_equal<i64>(0, key_mismatches(&keys, &values, &norm, &rotary, &key_cache_generated, &value_cache_generated, position, cache_first));
+}

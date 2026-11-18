@@ -1,0 +1,27 @@
+fn batch_capacity() -> i64 {
+    return 8;
+}
+
+fn state_slots() -> i64 {
+    return 9;
+}
+
+fn slot_values() -> i64 {
+    return 262144;
+}
+
+fn activation_stride() -> i64 {
+    return 32768;
+}
+
+fn block_stride() -> i64 {
+    return 64;
+}
+
+fn scalar_stride() -> i64 {
+    return 4;
+}
+
+fn hidden_stride() -> i64 {
+    return 5120;
+}

@@ -1,0 +1,152 @@
+import std::mem;
+
+fn profile_slots() -> i64 {
+    return 64;
+}
+
+fn profile_words() -> i64 {
+    return 2 + 3 * profile_slots();
+}
+
+/// queue is the Gpu's queue, which outlives this; state holds the open pass and per-pipeline totals.
+pub unsafe struct ProfiledPass {
+    queue: ptr<u8>,
+    state: Buffer,
+}
+
+pub fn (self: &Gpu) begin_profiled_pass() -> MetalError!ProfiledPass {
+    let state = try self.new_shared_buffer(cast<u64>(8 * profile_words()));
+    // SAFETY: the state buffer holds profile_words() u64, and nothing else uses it yet.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u64>>(state.contents()), profile_words());
+    for 0..profile_words() |index| {
+        words[index] = 0;
+    }
+    // SAFETY: the queue outlives the pass, as the struct promises.
+    return unsafe ProfiledPass { queue: self.queue, state: move state };
+}
+
+fn (self: &ProfiledPass) encoder() -> ptr<u8> {
+    // SAFETY: the state buffer holds profile_words() u64, and no GPU work uses it.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u64>>(self.state.contents()), profile_words());
+    if words[1] == 0 {
+        // SAFETY: the pool is popped below on every path.
+        let pool = unsafe objc_autoreleasePoolPush();
+        // SAFETY: pool came from the push above.
+        defer unsafe objc_autoreleasePoolPop(pool);
+        // SAFETY: a queue answers commandBuffer with an autoreleased buffer.
+        if unsafe send_returning_object(self.queue, selector_named(c"commandBuffer")) |commands| {
+            // SAFETY: a command buffer answers computeCommandEncoder likewise.
+            if unsafe send_returning_object(commands, selector_named(c"computeCommandEncoder")) |encoder| {
+                // SAFETY: both are live until the pool pops; the retains keep them past it.
+                unsafe retain_object(commands);
+                // SAFETY: as above.
+                unsafe retain_object(encoder);
+                // SAFETY: reading an address as an integer touches no memory.
+                words[0] = cast<u64>(unsafe int_from_ptr<usize>(commands));
+                // SAFETY: as above.
+                words[1] = cast<u64>(unsafe int_from_ptr<usize>(encoder));
+            }
+        }
+    }
+    // SAFETY: the word holds a retained encoder set above.
+    return unsafe ptr_from_int<ptr<u8>>(cast<usize>(words[1]));
+}
+
+pub fn (self: &ProfiledPass) bind_buffer(index: u64, buffer: &Buffer) -> void {
+    self.bind_buffer_from(index, buffer, 0);
+    return;
+}
+
+pub fn (self: &ProfiledPass) bind_buffer_from(index: u64, buffer: &Buffer, byte_offset: u64) -> void {
+    // SAFETY: setBuffer:offset:atIndex: takes a buffer and two NSUInteger.
+    let set_buffer = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<u8>, u64, u64) -> void>(objc_msg_send_address());
+    // SAFETY: as above; the caller keeps the buffer until the pass finishes and byte_offset lies inside it.
+    unsafe set_buffer(self.encoder(), selector_named(c"setBuffer:offset:atIndex:"), buffer.object, byte_offset, index);
+    return;
+}
+
+pub fn (self: &ProfiledPass) bind_bytes(index: u64, bytes: []u8) -> void {
+    // SAFETY: setBytes:length:atIndex: copies length bytes and takes two NSUInteger.
+    let set_bytes = unsafe cast<extern "c" fn(ptr<u8>, ptr<u8>, ptr<const u8>, u64, u64) -> void>(objc_msg_send_address());
+    // SAFETY: as above; bytes is read during the call only.
+    unsafe set_bytes(self.encoder(), selector_named(c"setBytes:length:atIndex:"), ptr_of(bytes), cast<u64>(mem::len(bytes)), index);
+    return;
+}
+
+pub fn (self: &ProfiledPass) dispatch_threadgroups(kernel: &Kernel, threadgroup_count: u64, threadgroup_width: u64) -> void {
+    let encoder = self.encoder();
+    // SAFETY: setComputePipelineState: takes a pipeline state.
+    unsafe send_object_returning_nothing(encoder, selector_named(c"setComputePipelineState:"), kernel.pipeline);
+    // SAFETY: dispatchThreadgroups:threadsPerThreadgroup: takes two MTLSize.
+    unsafe send_two_mtl_sizes(encoder, selector_named(c"dispatchThreadgroups:threadsPerThreadgroup:"), MtlSize { width: threadgroup_count, height: 1, depth: 1 }, MtlSize { width: threadgroup_width, height: 1, depth: 1 });
+    let seconds = self.run_open_pass();
+    // SAFETY: the state buffer holds profile_words() u64, and no GPU work uses it.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u64>>(self.state.contents()), profile_words());
+    // SAFETY: reading an address as an integer touches no memory.
+    let key = cast<u64>(unsafe int_from_ptr<usize>(kernel.pipeline));
+    for 0..profile_slots() |slot| {
+        let at = 2 + 3 * slot;
+        if words[at] == key or words[at] == 0 {
+            words[at] = key;
+            words[at + 1] = words[at + 1] + cast<u64>(seconds * 1000000000.0);
+            words[at + 2] = words[at + 2] + 1;
+            return;
+        }
+    }
+    return;
+}
+
+fn (self: &ProfiledPass) run_open_pass() -> f64 {
+    // SAFETY: the state buffer holds profile_words() u64, and no GPU work uses it.
+    let words = unsafe mut_view_from_ptr(unsafe cast<ptr<u64>>(self.state.contents()), profile_words());
+    if words[1] == 0 {
+        return 0.0;
+    }
+    // SAFETY: the words hold the retained command buffer and encoder set by encoder().
+    let commands = unsafe ptr_from_int<ptr<u8>>(cast<usize>(words[0]));
+    // SAFETY: as above.
+    let encoder = unsafe ptr_from_int<ptr<u8>>(cast<usize>(words[1]));
+    words[0] = 0;
+    words[1] = 0;
+    // SAFETY: each of these takes and returns nothing.
+    unsafe send_returning_nothing(encoder, selector_named(c"endEncoding"));
+    // SAFETY: as above.
+    unsafe send_returning_nothing(commands, selector_named(c"commit"));
+    // SAFETY: as above.
+    unsafe send_returning_nothing(commands, selector_named(c"waitUntilCompleted"));
+    // SAFETY: a command buffer answers GPUStartTime with a CFTimeInterval.
+    let start = unsafe send_returning_f64(commands, selector_named(c"GPUStartTime"));
+    // SAFETY: likewise GPUEndTime.
+    let end = unsafe send_returning_f64(commands, selector_named(c"GPUEndTime"));
+    // SAFETY: both references came from encoder() and are given up here.
+    unsafe release_object(encoder);
+    // SAFETY: as above.
+    unsafe release_object(commands);
+    return end - start;
+}
+
+pub fn (self: &ProfiledPass) finish() -> MetalError!void {
+    self.run_open_pass();
+    return;
+}
+
+pub fn (self: &ProfiledPass) print_kernel(kernel: &Kernel, name: []u8) -> void {
+    // SAFETY: the state buffer holds profile_words() u64, and no GPU work uses it.
+    let words = unsafe view_from_ptr(unsafe cast<ptr<const u64>>(self.state.contents()), profile_words());
+    // SAFETY: reading an address as an integer touches no memory.
+    let key = cast<u64>(unsafe int_from_ptr<usize>(kernel.pipeline));
+    for 0..profile_slots() |slot| {
+        let at = 2 + 3 * slot;
+        if words[at] == key {
+            print(name);
+            print(cast<i64>(words[at + 1] / 1000));
+            print(cast<i64>(words[at + 2]));
+        }
+    }
+    return;
+}
+
+pub fn (self: ProfiledPass) release() -> void {
+    self.state.release();
+    return;
+}

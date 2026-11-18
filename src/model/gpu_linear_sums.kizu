@@ -1,0 +1,213 @@
+import kizukani::metal;
+import std::fs;
+import std::io;
+import std::mem;
+
+pub fn linear_sums_simdgroups_per_row_group() -> i64 {
+    return 4;
+}
+
+pub fn largest_projection_cols() -> i64 {
+    return 32768;
+}
+
+pub fn largest_projection_physical_rows() -> i64 {
+    return 262144;
+}
+
+pub fn linear_slot_count() -> i64 {
+    return 4;
+}
+
+pub fn mapping_page_bytes() -> u64 {
+    return 16384;
+}
+
+/// Every buffer is retained; file_bytes wraps the model mapping, which the caller keeps until release().
+pub unsafe struct GpuLinearSums {
+    gpu: metal::Gpu,
+    six_bit_kernel: metal::Kernel,
+    eight_bit_kernel: metal::Kernel,
+    file_bytes: metal::Buffer,
+    file_address: u64,
+    file_byte_count: u64,
+    simdgroups: i64,
+    weight_table: metal::Buffer,
+    activation: metal::Buffer,
+    block_weights: metal::Buffer,
+    row_sums: metal::Buffer,
+    status: metal::Buffer,
+}
+
+fn bind_values(pass: &metal::ComputePass, index: u64, values: []i64) -> void {
+    // SAFETY: the values are 8 * count readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(values));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, mem::count<i64>(values) * 8);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn rounded_up_to_page(byte_count: u64) -> u64 {
+    return (byte_count + mapping_page_bytes() - 1) / mapping_page_bytes() * mapping_page_bytes();
+}
+
+/// file_address is the page-aligned start of a mapping of file_byte_count bytes that outlives the result.
+pub unsafe fn open_gpu_linear_sums(allocator: Allocator, file_address: u64, file_byte_count: u64) -> ProjectionError!GpuLinearSums {
+    let path = generated_kernel_path();
+    // SAFETY: the caller keeps the mapping, as this function requires.
+    return try unsafe open_gpu_linear_sums_from(allocator, path, linear_sums_simdgroups_per_row_group(), file_address, file_byte_count);
+}
+
+/// file_address is the page-aligned start of a mapping of file_byte_count bytes that outlives the result.
+pub unsafe fn open_gpu_linear_sums_from(allocator: Allocator, kernel_path: []u8, simdgroups: i64, file_address: u64, file_byte_count: u64) -> ProjectionError!GpuLinearSums {
+    let gpu = try metal::open_default_gpu();
+    errdefer gpu.release();
+    let wrapped_byte_count = rounded_up_to_page(file_byte_count);
+    if wrapped_byte_count > gpu.max_buffer_length() {
+        return ModelError::UnsupportedModel;
+    }
+    let kernel_source = try fs::read_file(io::blocking(), allocator, &kernel_path, mem::Limit::Unlimited);
+    defer kernel_source.deinit(allocator);
+    let source_bytes = kernel_source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let six_bit_kernel = try library.kernel(&gpu, c"compressed_linear_row_sums_six");
+    errdefer six_bit_kernel.release();
+    let eight_bit_kernel = try library.kernel(&gpu, c"compressed_linear_row_sums_eight");
+    errdefer eight_bit_kernel.release();
+    // SAFETY: file_address starts a page-aligned mapping whose last page is readable to its end, kept by the caller.
+    let file_bytes = try unsafe gpu.wrap_shared_bytes(unsafe ptr_from_int<ptr<u8>>(cast<usize>(file_address)), wrapped_byte_count);
+    errdefer file_bytes.release();
+    let weight_table = try gpu.new_shared_buffer(cast<u64>(8192 * linear_slot_count()));
+    errdefer weight_table.release();
+    let activation = try gpu.new_shared_buffer(cast<u64>(largest_projection_cols()));
+    errdefer activation.release();
+    let block_weights = try gpu.new_shared_buffer(cast<u64>(largest_projection_cols() / 512 * 8));
+    errdefer block_weights.release();
+    let row_sums = try gpu.new_shared_buffer(cast<u64>(largest_projection_physical_rows() * 8 * linear_slot_count()));
+    errdefer row_sums.release();
+    let status = try gpu.new_shared_buffer(4);
+    // SAFETY: every field is retained above, and the caller keeps the mapping, as the struct promises.
+    return unsafe GpuLinearSums {
+        gpu: move gpu,
+        six_bit_kernel: move six_bit_kernel,
+        eight_bit_kernel: move eight_bit_kernel,
+        file_bytes: move file_bytes,
+        file_address: file_address,
+        file_byte_count: wrapped_byte_count,
+        simdgroups: simdgroups,
+        weight_table: move weight_table,
+        activation: move activation,
+        block_weights: move block_weights,
+        row_sums: move row_sums,
+        status: move status,
+    };
+}
+
+pub fn (self: GpuLinearSums) deinit(allocator: Allocator) -> void {
+    self.status.release();
+    self.row_sums.release();
+    self.block_weights.release();
+    self.activation.release();
+    self.weight_table.release();
+    self.file_bytes.release();
+    self.eight_bit_kernel.release();
+    self.six_bit_kernel.release();
+    self.gpu.release();
+    return;
+}
+
+pub fn supports_linear(linear: &CompressedLinear) -> bool {
+    return linear.cols <= largest_projection_cols() and linear.physical_rows <= largest_projection_physical_rows() and linear.physical_rows % 32 == 0 and linear.warp_layout and (linear.bits_per_step == 6 or linear.bits_per_step == 8);
+}
+
+pub fn (self: &GpuLinearSums) begin_shared_activation_pass(activation: &QuantizedActivation) -> ProjectionError!metal::ComputePass {
+    let count = activation.values.len();
+    let block_count = activation.block_weights.len();
+    if count > largest_projection_cols() {
+        return ModelError::UnsupportedModel;
+    }
+    // SAFETY: each buffer was sized in open_gpu_linear_sums for at least these counts, and no GPU work is in flight.
+    let activation_cells = unsafe cast<ptr<i8>>(self.activation.contents());
+    // SAFETY: as above.
+    let activation_view = unsafe mut_view_from_ptr(activation_cells, count);
+    // SAFETY: as above.
+    let block_weight_cells = unsafe cast<ptr<i64>>(self.block_weights.contents());
+    // SAFETY: as above.
+    let block_weight_view = unsafe mut_view_from_ptr(block_weight_cells, block_count);
+    let values = activation.values.as_slice();
+    for 0..count |index| {
+        activation_view[index] = values[index];
+    }
+    let weights = activation.block_weights.as_slice();
+    for 0..block_count |index| {
+        block_weight_view[index] = weights[index];
+    }
+    // SAFETY: the status buffer holds one u32, and no GPU work is in flight.
+    let status_view = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(self.status.contents()), 1);
+    status_view[0] = 0;
+    return try self.gpu.begin_compute_pass();
+}
+
+pub fn (self: &GpuLinearSums) encode_row_sums(pass: &metal::ComputePass, slot: i64, linear: &CompressedLinear) -> void {
+    // SAFETY: the tables hold linear_slot_count() slots, slot is below it, and the pass has not been committed.
+    let table_cells = unsafe cast<ptr<i8>>(self.weight_table.contents());
+    // SAFETY: as above.
+    let table_view = unsafe mut_view_from_ptr(table_cells, 8192 * linear_slot_count());
+    let table = linear.weight_table.as_slice();
+    for 0..8192 |index| {
+        table_view[slot * 8192 + index] = table[index];
+    }
+
+    let code_offset = linear.code_address - self.file_address;
+    let row_sum_offset = cast<u64>(slot * largest_projection_physical_rows() * 8);
+    pass.bind_buffer_from(0, &self.file_bytes, code_offset);
+    pass.bind_buffer_from(1, &self.weight_table, cast<u64>(slot * 8192));
+    pass.bind_buffer(2, &self.activation);
+    pass.bind_buffer(3, &self.block_weights);
+    pass.bind_buffer_from(4, &self.row_sums, row_sum_offset);
+    let shape = [2]i64{ linear.physical_rows, linear.cols / 256 };
+    let shape_view = shape.as_slice();
+    bind_values(pass, 5, shape_view[0..1]);
+    bind_values(pass, 6, shape_view[1..2]);
+    let lengths = [5]i64{
+        cast<i64>((self.file_byte_count - code_offset) / 4),
+        (linear_slot_count() - slot) * 4096,
+        largest_projection_cols(),
+        largest_projection_cols() / 512,
+        (linear_slot_count() - slot) * largest_projection_physical_rows()
+    };
+    let length_view = lengths.as_slice();
+    bind_values(pass, 7, length_view);
+    pass.bind_buffer(8, &self.status);
+    let threadgroup_width = cast<u64>(32 * self.simdgroups);
+    let threadgroup_count = cast<u64>(linear.physical_rows / 32);
+    if linear.bits_per_step == 6 {
+        pass.dispatch_threadgroups(&self.six_bit_kernel, threadgroup_count, threadgroup_width);
+    } else {
+        pass.dispatch_threadgroups(&self.eight_bit_kernel, threadgroup_count, threadgroup_width);
+    }
+    return;
+}
+
+pub fn (self: &GpuLinearSums) check_status() -> ModelError!void {
+    // SAFETY: the pass that used the status word finished.
+    let status_view = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(self.status.contents()), 1);
+    if status_view[0] != 0 {
+        return ModelError::KernelFailed;
+    }
+    return;
+}
+
+pub fn (self: &GpuLinearSums) copy_row_sums(slot: i64, linear: &CompressedLinear, sums: &var []i64) -> void {
+    // SAFETY: the pass that wrote this slot finished, and each slot holds largest_projection_physical_rows() sums.
+    let row_sum_cells = unsafe cast<ptr<const i64>>(self.row_sums.contents());
+    // SAFETY: as above.
+    let row_sum_view = unsafe view_from_ptr(row_sum_cells, largest_projection_physical_rows() * linear_slot_count());
+    let first = slot * largest_projection_physical_rows();
+    for 0..linear.physical_rows |row| {
+        sums[row] = row_sum_view[first + row];
+    }
+    return;
+}

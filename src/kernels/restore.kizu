@@ -1,0 +1,35 @@
+import std::gpu;
+
+export "gpu" fn restore_rows(
+    sums: []i64,
+    scales: []f32,
+    signs: []i8,
+    scalars: []f32,
+    output: &var []f32,
+    physical_rows: i64,
+    rows: i64,
+    rotated: u32,
+    groups_per_token: i64
+) -> void {
+    var shared = gpu::group_array<[512]f32>();
+    var values = shared.as_mut_slice();
+    let thread_in_group = gpu::local_index();
+    let token = gpu::group_index() / groups_per_token;
+    let row = (gpu::group_index() % groups_per_token) * 512 + thread_in_group;
+    let first = token * slot_values();
+    let inverse_rms = scalars[token * scalar_stride()];
+    let quantum = scalars[token * scalar_stride() + 1];
+    var value: f32 = 0.0;
+    if row < physical_rows {
+        value = ((cast<f32>(sums[first + row]) * quantum) * inverse_rms) * scales[row];
+    }
+    if rotated != 0 {
+        values[thread_in_group] = value;
+        hadamard_in_group(&var values, thread_in_group);
+        value = (values[thread_in_group] * inverse_sqrt_hadamard_width()) * cast<f32>(signs[row]);
+    }
+    if row < rows {
+        output[first + row] = value;
+    }
+    return;
+}

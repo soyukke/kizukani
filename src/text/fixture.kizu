@@ -1,0 +1,106 @@
+import std::array;
+import std::mem;
+import std::string;
+
+fn hex_value(value: u8) -> u8 {
+    if value >= 97 {
+        return value - 87;
+    }
+    return value - 48;
+}
+
+fn append_hex(allocator: Allocator, text: []u8, out: &var string::String) -> mem::Error!void {
+    var at: i64 = 0;
+    while at + 1 < mem::len(text) {
+        try out.append_byte(allocator, hex_value(text[at]) * 16 + hex_value(text[at + 1]));
+        at = at + 2;
+    }
+    return;
+}
+
+fn append_numbers(allocator: Allocator, text: []u8, out: &var array::Array<i64>) -> mem::Error!void {
+    var value: i64 = 0;
+    var inside = false;
+    for 0..mem::len(text) |index| {
+        if text[index] == 32 {
+            try out.append(allocator, value);
+            value = 0;
+            inside = false;
+        } else {
+            value = value * 10 + cast<i64>(text[index]) - 48;
+            inside = true;
+        }
+    }
+    if inside {
+        try out.append(allocator, value);
+    }
+    return;
+}
+
+fn field_end(text: []u8, from: i64, separator: u8) -> i64 {
+    var at = from;
+    while at < mem::len(text) and text[at] != separator {
+        at = at + 1;
+    }
+    return at;
+}
+
+/// Counts the lines of a fixture (hex text, token ids, hex decoded text) that this tokenizer gets wrong, printing the first few.
+pub fn (self: &Tokenizer) count_fixture_mismatches(allocator: Allocator, fixture: []u8) -> mem::Error!i64 {
+    var mismatches: i64 = 0;
+    var cases: i64 = 0;
+    var line: i64 = 0;
+    while line < mem::len(fixture) {
+        let line_end = field_end(fixture, line, 10);
+        let first_end = field_end(fixture, line, 9);
+        let second_end = field_end(fixture, first_end + 1, 9);
+        var text = string::new(allocator);
+        defer text.deinit(allocator);
+        try append_hex(allocator, fixture[line..first_end], &var text);
+        var expected = array::new<i64>(allocator);
+        defer expected.deinit(allocator);
+        try append_numbers(allocator, fixture[first_end + 1..second_end], &var expected);
+        var decoded = string::new(allocator);
+        defer decoded.deinit(allocator);
+        try append_hex(allocator, fixture[second_end + 1..line_end], &var decoded);
+        var got = array::new<i64>(allocator);
+        defer got.deinit(allocator);
+        let text_view = text.as_bytes();
+        try self.encode(allocator, text_view, &var got);
+        var same = got.len() == expected.len();
+        if same {
+            let got_view = got.as_slice();
+            let expected_view = expected.as_slice();
+            for 0..got.len() |index| {
+                if got_view[index] != expected_view[index] {
+                    same = false;
+                }
+            }
+        }
+        var bytes = string::new(allocator);
+        defer bytes.deinit(allocator);
+        let got_view = got.as_slice();
+        for 0..got.len() |index| {
+            try self.append_token_bytes(allocator, got_view[index], &var bytes);
+        }
+        let byte_view = bytes.as_bytes();
+        let decoded_view = decoded.as_bytes();
+        if same and !mem::equal_bytes(byte_view, decoded_view) {
+            same = false;
+        }
+        if !same {
+            mismatches = mismatches + 1;
+            if mismatches <= 8 {
+                print("mismatch at case:");
+                print(cases);
+                print(fixture[line..first_end]);
+            }
+        }
+        cases = cases + 1;
+        line = line_end + 1;
+    }
+    print("cases, mismatches:");
+    print(cases);
+    print(mismatches);
+    return mismatches;
+}

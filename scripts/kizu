@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${KIZU_SRC:?set KIZU_SRC to a Kizu checkout built with just stage1}"
+export KIZU_LIB_DIR="$KIZU_SRC/lib/kizu"
+exec "$KIZU_SRC/target/seed/stage1/bin/kizu" "$@"

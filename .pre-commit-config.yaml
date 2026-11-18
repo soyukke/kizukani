@@ -1,0 +1,14 @@
+repos:
+  - repo: local
+    hooks:
+      - id: no-code-comments
+        name: only doc and SAFETY comments in Kizu sources
+        language: system
+        entry: python3 scripts/comment-lint/check.py
+        files: ^src/.*\.kizu$
+      - id: comment-lint-test
+        name: comment lint tests
+        language: system
+        entry: python3 scripts/comment-lint/test.py
+        files: ^scripts/comment-lint/
+        pass_filenames: false

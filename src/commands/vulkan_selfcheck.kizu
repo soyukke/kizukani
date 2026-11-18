@@ -1,0 +1,86 @@
+import kizukani::vulkan;
+import std::array;
+import std::float;
+import std::fs;
+import std::io;
+import std::mem;
+import std::rand;
+
+fn rounded_to_bf16(value: f32) -> f32 {
+    let bits = float::bits_f32(value);
+    if (bits & 0x7f800000) == 0x7f800000 {
+        return value;
+    }
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    return float::from_bits_f32((bits + rounding) & 0xffff0000);
+}
+
+fn is_nan_bits(bits: u32) -> bool {
+    return (bits & 0x7f800000) == 0x7f800000 and (bits & 0x7fffff) != 0;
+}
+
+pub fn run_vulkan_selfcheck() -> !void {
+    let allocator = mem::page_allocator();
+    let gpu = try vulkan::open_default_gpu();
+    defer gpu.deinit();
+    let path = "kernels.spv";
+    let code = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer code.deinit(allocator);
+    let code_bytes = code.as_bytes();
+    let library = try gpu.load_library(code_bytes);
+    defer library.release(&gpu);
+    let kernel = try library.kernel(&gpu, c"add_residual", 256, 3);
+    defer kernel.release(&gpu);
+    let count: i64 = 65536;
+    let hidden = try gpu.new_shared_buffer(cast<u64>(count * 4));
+    defer hidden.release(&gpu);
+    let projected = try gpu.new_shared_buffer(cast<u64>(count * 4));
+    defer projected.release(&gpu);
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release(&gpu);
+    var expected = array::new<u32>(allocator);
+    defer expected.deinit(allocator);
+    // SAFETY: the buffer holds count f32, and no GPU work uses it yet.
+    let hidden_values = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(hidden.contents()), count);
+    // SAFETY: as above.
+    let projected_values = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(projected.contents()), count);
+    // SAFETY: the status buffer holds one u32, and no GPU work uses it yet.
+    let status_words = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(status.contents()), 1);
+    status_words[0] = 0;
+    var random = rand::new(5);
+    for 0..count |index| {
+        hidden_values[index] = float::from_bits_f32(cast<u32>(random.below(4294967296)));
+        projected_values[index] = float::from_bits_f32(cast<u32>(random.below(4294967296)));
+        let sum = rounded_to_bf16(hidden_values[index] + rounded_to_bf16(projected_values[index]));
+        try expected.append(allocator, float::bits_f32(sum));
+    }
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &hidden);
+    pass.bind_buffer(1, &projected);
+    let width = [1]i64{ count };
+    let width_view = width.as_slice();
+    // SAFETY: the word is eight readable bytes for the duration of the call.
+    let width_bytes = unsafe view_from_ptr(unsafe cast<ptr<const u8>>(ptr_of(width_view)), 8);
+    pass.bind_bytes(2, width_bytes);
+    let lengths = [2]i64{ count, count };
+    let length_view = lengths.as_slice();
+    // SAFETY: the two words are sixteen readable bytes for the duration of the call.
+    let length_bytes = unsafe view_from_ptr(unsafe cast<ptr<const u8>>(ptr_of(length_view)), 16);
+    pass.bind_bytes(3, length_bytes);
+    pass.bind_buffer(4, &status);
+    pass.dispatch_threadgroups(&kernel, cast<u64>(count / 256), 256);
+    try pass.finish();
+    var mismatches: i64 = 0;
+    for 0..count |index| {
+        let got = float::bits_f32(hidden_values[index]);
+        let want = expected.get_or_panic(index);
+        if got != want and !(is_nan_bits(got) and is_nan_bits(want)) {
+            mismatches = mismatches + 1;
+        }
+    }
+    print("add_residual mismatches");
+    print(mismatches);
+    print("status");
+    print(status_words[0]);
+    return;
+}

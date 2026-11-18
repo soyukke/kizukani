@@ -1,0 +1,64 @@
+fn skipped_capacity() -> i64 {
+    return 8;
+}
+
+/// Wraps a compute pass and drops every dispatch of the skipped pipelines.
+pub struct SkippingPass {
+    pass: ComputePass,
+    skipped: [8]u64,
+    skipped_count: i64,
+}
+
+pub fn (self: &Gpu) begin_skipping_pass() -> MetalError!SkippingPass {
+    let pass = try self.begin_compute_pass();
+    return SkippingPass { pass: move pass, skipped: [8]u64{}, skipped_count: 0 };
+}
+
+fn pipeline_key(kernel: &Kernel) -> u64 {
+    // SAFETY: reading an address as an integer touches no memory.
+    return cast<u64>(unsafe int_from_ptr<usize>(kernel.pipeline));
+}
+
+pub fn (self: &var SkippingPass) skip(kernel: &Kernel) -> void {
+    if self.skipped_count < skipped_capacity() {
+        self.skipped[self.skipped_count] = pipeline_key(kernel);
+        self.skipped_count = self.skipped_count + 1;
+    }
+    return;
+}
+
+fn (self: &SkippingPass) is_skipped(kernel: &Kernel) -> bool {
+    let key = pipeline_key(kernel);
+    for 0..self.skipped_count |index| {
+        if self.skipped[index] == key {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn (self: &SkippingPass) bind_buffer(index: u64, buffer: &Buffer) -> void {
+    self.pass.bind_buffer(index, buffer);
+    return;
+}
+
+pub fn (self: &SkippingPass) bind_buffer_from(index: u64, buffer: &Buffer, byte_offset: u64) -> void {
+    self.pass.bind_buffer_from(index, buffer, byte_offset);
+    return;
+}
+
+pub fn (self: &SkippingPass) bind_bytes(index: u64, bytes: []u8) -> void {
+    self.pass.bind_bytes(index, bytes);
+    return;
+}
+
+pub fn (self: &SkippingPass) dispatch_threadgroups(kernel: &Kernel, threadgroup_count: u64, threadgroup_width: u64) -> void {
+    if !self.is_skipped(kernel) {
+        self.pass.dispatch_threadgroups(kernel, threadgroup_count, threadgroup_width);
+    }
+    return;
+}
+
+pub fn (self: SkippingPass) finish_and_measure_gpu_seconds() -> MetalError!f64 {
+    return try self.pass.finish_and_measure_gpu_seconds();
+}

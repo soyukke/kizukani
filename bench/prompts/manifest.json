@@ -1,0 +1,30 @@
+{
+  "warmup": {
+    "prompt_tokens": 23,
+    "thinking": false
+  },
+  "prose_short": {
+    "prompt_tokens": 29,
+    "thinking": false
+  },
+  "code_short": {
+    "prompt_tokens": 31,
+    "thinking": false
+  },
+  "thinking_short": {
+    "prompt_tokens": 95,
+    "thinking": true
+  },
+  "prose_long": {
+    "prompt_tokens": 2027,
+    "thinking": false
+  },
+  "code_long": {
+    "prompt_tokens": 2032,
+    "thinking": false
+  },
+  "thinking_long": {
+    "prompt_tokens": 2067,
+    "thinking": true
+  }
+}

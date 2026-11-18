@@ -1,0 +1,57 @@
+import std::gpu;
+
+export "gpu" fn trellis_matvec_six(
+    code_words: []u32,
+    state_values: []f32,
+    row_scales: []f32,
+    x: []f32,
+    y: &var []f32,
+    physical_rows: i64,
+    sequences: i64,
+    simdgroups: i64
+) -> void {
+    var value_storage = gpu::group_array<[4096]u32>();
+    var values = value_storage.as_mut_slice();
+    var dot_storage = gpu::group_array<[256]f32>();
+    var dots = dot_storage.as_mut_slice();
+    var index = gpu::local_index();
+    while index < 4096 {
+        let low = cast<u32>(gpu::half_from_f32(state_values[2 * index]));
+        let high = cast<u32>(gpu::half_from_f32(state_values[2 * index + 1]));
+        values[index] = low | (high << 16);
+        index = index + simdgroups * 32;
+    }
+    gpu::barrier();
+    let lane = gpu::lane_index();
+    let simdgroup = gpu::simdgroup_index();
+    let row_group = gpu::group_index();
+    let row_groups = physical_rows / 32;
+    var row_dot: f32 = 0.0;
+    var sequence = simdgroup;
+    while sequence < sequences {
+        let first_word = (sequence * row_groups + row_group) * 768 + lane * 4;
+        let words = code_words[first_word..first_word + 644];
+        let first_input = sequence * 256;
+        let inputs = x[first_input..first_input + 256];
+        row_dot = six_group<f32>(&values, words, inputs, 0, row_dot);
+        row_dot = six_group<f32>(&values, words, inputs, 1, row_dot);
+        row_dot = six_group<f32>(&values, words, inputs, 2, row_dot);
+        row_dot = six_group<f32>(&values, words, inputs, 3, row_dot);
+        row_dot = six_group<f32>(&values, words, inputs, 4, row_dot);
+        row_dot = six_group<f32>(&values, words, inputs, 5, row_dot);
+        row_dot = six_group<f32>(&values, words, inputs, 6, row_dot);
+        row_dot = six_group<f32>(&values, words, inputs, 7, row_dot);
+        sequence = sequence + simdgroups;
+    }
+    dots[simdgroup * 32 + lane] = row_dot;
+    gpu::barrier();
+    if simdgroup == 0 {
+        var total: f32 = 0.0;
+        for 0..simdgroups |other| {
+            total = total + dots[other * 32 + lane];
+        }
+        let row = row_group * 32 + lane;
+        y[row] = total * row_scales[row];
+    }
+    return;
+}

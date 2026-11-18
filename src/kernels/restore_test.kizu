@@ -1,0 +1,147 @@
+import kizukani::metal;
+import std::float;
+import std::mem;
+import std::rand;
+import std::testing;
+
+fn bind_i64_values(pass: &metal::ComputePass, index: u64, values: []i64) -> void {
+    // SAFETY: the values are 8 * count readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(values));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, mem::count<i64>(values) * 8);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn bind_u32_values(pass: &metal::ComputePass, index: u64, values: []u32) -> void {
+    // SAFETY: the values are 4 * count readable bytes for the duration of the call.
+    let cells = unsafe cast<ptr<const u8>>(ptr_of(values));
+    // SAFETY: as above.
+    let bytes = unsafe view_from_ptr(cells, mem::count<u32>(values) * 4);
+    pass.bind_bytes(index, bytes);
+    return;
+}
+
+fn fill_restore_inputs(sums: &metal::Buffer, scales: &metal::Buffer, signs: &metal::Buffer, scalars: &metal::Buffer, count: i64) -> void {
+    var random = rand::new(21);
+    // SAFETY: each buffer holds count elements of its type, and no GPU work uses them yet.
+    let sum_view = unsafe mut_view_from_ptr(unsafe cast<ptr<i64>>(sums.contents()), count);
+    // SAFETY: as above.
+    let scale_view = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(scales.contents()), count);
+    // SAFETY: as above.
+    let sign_view = unsafe mut_view_from_ptr(unsafe cast<ptr<i8>>(signs.contents()), count);
+    for 0..count |index| {
+        sum_view[index] = random.below(2000000001) - 1000000000;
+        scale_view[index] = cast<f32>(random.below(2000001) - 1000000) / cast<f32>(3571.0);
+        sign_view[index] = cast<i8>(random.below(2) * 2 - 1);
+    }
+    // SAFETY: the scalar buffer holds two f32.
+    let scalar_view = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(scalars.contents()), 2);
+    scalar_view[0] = cast<f32>(0.0078125);
+    scalar_view[1] = cast<f32>(1.0) / cast<f32>(3.0);
+    return;
+}
+
+fn restore_mismatches(rotated: u32) -> !i64 {
+    let allocator = mem::page_allocator();
+    let source = try generated_kernel_source(allocator);
+    defer source.deinit(allocator);
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let source_bytes = source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let generated = try library.kernel(&gpu, c"restore_rows");
+    defer generated.release();
+
+    let groups: i64 = 4;
+    let count = groups * 512;
+    let physical_rows: i64 = 2000;
+    let rows: i64 = 1990;
+    let sums = try gpu.new_shared_buffer(cast<u64>(count * 8));
+    defer sums.release();
+    let scales = try gpu.new_shared_buffer(cast<u64>(count * 4));
+    defer scales.release();
+    let signs = try gpu.new_shared_buffer(cast<u64>(count));
+    defer signs.release();
+    let scalars = try gpu.new_shared_buffer(8);
+    defer scalars.release();
+    let output_generated = try gpu.new_shared_buffer(cast<u64>(count * 4));
+    defer output_generated.release();
+    let status = try gpu.new_shared_buffer(4);
+    defer status.release();
+    fill_restore_inputs(&sums, &scales, &signs, &scalars, count);
+    clear_status(&status);
+
+    let pass = try gpu.begin_compute_pass();
+    pass.bind_buffer(0, &sums);
+    pass.bind_buffer(1, &scales);
+    pass.bind_buffer(2, &signs);
+    pass.bind_buffer(3, &scalars);
+    pass.bind_buffer(4, &output_generated);
+    let physical = [1]i64{ physical_rows };
+    let physical_view = physical.as_slice();
+    bind_i64_values(&pass, 5, physical_view);
+    let logical = [1]i64{ rows };
+    let logical_view = logical.as_slice();
+    bind_i64_values(&pass, 6, logical_view);
+    let flag = [1]u32{ rotated };
+    let flag_view = flag.as_slice();
+    bind_u32_values(&pass, 7, flag_view);
+    let group_words = [1]i64{ groups };
+    let group_word_view = group_words.as_slice();
+    bind_i64_values(&pass, 8, group_word_view);
+    let lengths = [5]i64{ count, count, count, 2, count };
+    let lengths_view = lengths.as_slice();
+    bind_i64_values(&pass, 9, lengths_view);
+    pass.bind_buffer(10, &status);
+    pass.dispatch_threadgroups(&generated, cast<u64>(groups), 512);
+    try pass.finish();
+
+    testing::expect_equal<u32>(0, status_word(&status));
+    // SAFETY: the pass finished, and each buffer holds count elements of its type.
+    let sum_view = unsafe view_from_ptr(unsafe cast<ptr<const i64>>(sums.contents()), count);
+    // SAFETY: the pass finished, and the buffer holds count f32.
+    let scale_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(scales.contents()), count);
+    // SAFETY: as above.
+    let sign_view = unsafe view_from_ptr(unsafe cast<ptr<const i8>>(signs.contents()), count);
+    // SAFETY: the pass finished, and the buffer holds 2 f32.
+    let scalar_view = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(scalars.contents()), 2);
+    // SAFETY: the pass finished, and the buffer holds rows u32.
+    let got = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(output_generated.contents()), rows);
+    var mismatches: i64 = 0;
+    var group = [512]f32{};
+    var group_view = group.as_mut_slice();
+    for 0..groups |group_index| {
+        for 0..512 |local| {
+            let row = group_index * 512 + local;
+            var value: f32 = 0.0;
+            if row < physical_rows {
+                value = ((cast<f32>(sum_view[row]) * scalar_view[1]) * scalar_view[0]) * scale_view[row];
+            }
+            group_view[local] = value;
+        }
+        if rotated != 0 {
+            hadamard_on_cpu(&var group_view);
+        }
+        for 0..512 |local| {
+            let row = group_index * 512 + local;
+            var value = group_view[local];
+            if rotated != 0 {
+                value = (value * inverse_sqrt_hadamard_width()) * cast<f32>(sign_view[row]);
+            }
+            if row < rows and !same_float_bits(got[row], float::bits_f32(value)) {
+                mismatches = mismatches + 1;
+            }
+        }
+    }
+    return mismatches;
+}
+
+test "the restore_rows kernel matches the cpu restore when rotated" {
+    testing::expect_equal<i64>(0, try restore_mismatches(1));
+}
+
+test "the restore_rows kernel matches the cpu restore without rotation" {
+    testing::expect_equal<i64>(0, try restore_mismatches(0));
+}

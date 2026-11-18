@@ -1,0 +1,7 @@
+[project]
+name = "kizukani-bench-omlx"
+version = "0.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "omlx @ https://github.com/jundot/omlx/releases/download/v0.8.0/omlx-0.8.0-cp312-cp312-macosx_15_0_universal2.whl#sha256=88b45f359f27d506340c74a2ed7f44b2ebf9406d4a1605785a4be28dcbd3f0ed",
+]

@@ -1,0 +1,120 @@
+import kizukani::commands;
+import std::mem;
+import std::process;
+
+fn main() -> !void {
+    if process::arg_count() < 1 {
+        print("usage: kizukani <chat|gpu-benchmark|cpu-selfcheck|gpu-selfcheck|cpu-projection-benchmark|gpu-projection-benchmark|gpu-row-sums-comparison|gpu-decode-selfcheck|gpu-decode-benchmark>");
+        return;
+    }
+    let command = try process::arg(0);
+    comptime if std::target::is_windows() {
+        if mem::equal_bytes(command, "vulkan-selfcheck") {
+            try commands::run_vulkan_selfcheck();
+            return;
+        }
+        if mem::equal_bytes(command, "gpu-decode-selfcheck") {
+            try commands::run_gpu_decode_selfcheck(12);
+            return;
+        }
+        print("unknown command");
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-benchmark") {
+        try commands::run_gpu_benchmark();
+        return;
+    }
+    if mem::equal_bytes(command, "cpu-selfcheck") {
+        try commands::run_plain_text_selfcheck(12, false);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-selfcheck") {
+        try commands::run_plain_text_selfcheck(12, true);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-decode-selfcheck") {
+        try commands::run_gpu_decode_selfcheck(12);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-decode-benchmark") {
+        try commands::run_gpu_decode_benchmark(48, 128);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-row-sums-comparison") and process::arg_count() >= 3 {
+        let first_path = try process::arg(1);
+        let second_path = try process::arg(2);
+        var first_simdgroups: i64 = 4;
+        var second_simdgroups: i64 = 4;
+        if process::arg_count() == 5 {
+            first_simdgroups = cast<i64>((try process::arg(3))[0]) - 48;
+            second_simdgroups = cast<i64>((try process::arg(4))[0]) - 48;
+        }
+        try commands::run_row_sums_comparison(first_path, second_path, first_simdgroups, second_simdgroups, 300);
+        return;
+    }
+    if mem::equal_bytes(command, "chat") {
+        try commands::run_chat();
+        return;
+    }
+    if mem::equal_bytes(command, "tokenizer-check") and process::arg_count() == 2 {
+        let path = try process::arg(1);
+        try commands::run_tokenizer_check(path);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-ablation") {
+        try commands::run_gpu_ablation(9);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-speculative-selfcheck") and process::arg_count() >= 2 {
+        let mode_name = try process::arg(1);
+        var mode = commands::DraftMode::None;
+        if mem::equal_bytes(mode_name, "ngram") {
+            mode = commands::DraftMode::Ngram;
+        }
+        if mem::equal_bytes(mode_name, "oracle") {
+            mode = commands::DraftMode::Oracle;
+        }
+        if mem::equal_bytes(mode_name, "neural") {
+            mode = commands::DraftMode::Neural;
+        }
+        if mem::equal_bytes(mode_name, "both") {
+            mode = commands::DraftMode::Both;
+        }
+        var generated_count: i64 = 12;
+        if process::arg_count() >= 3 {
+            let digits = try process::arg(2);
+            generated_count = 0;
+            for 0..mem::len(digits) |index| {
+                generated_count = generated_count * 10 + cast<i64>(digits[index]) - 48;
+            }
+        }
+        if process::arg_count() >= 4 {
+            let prompt_path = try process::arg(3);
+            var quality = false;
+            if process::arg_count() == 5 {
+                let model_name = try process::arg(4);
+                quality = mem::equal_bytes(model_name, "quality");
+            }
+            try commands::run_speculative_task(mode, generated_count, prompt_path, quality);
+            return;
+        }
+        try commands::run_speculative_selfcheck(mode, generated_count);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-batch-benchmark") and process::arg_count() == 3 {
+        let kernel_path = try process::arg(1);
+        let batch = cast<i64>((try process::arg(2))[0]) - 48;
+        try commands::run_gpu_batch_benchmark(kernel_path, batch);
+        return;
+    }
+    if mem::equal_bytes(command, "gpu-projection-benchmark") {
+        try commands::run_gpu_projection_benchmark();
+        return;
+    }
+    if mem::equal_bytes(command, "cpu-projection-benchmark") {
+        try commands::run_cpu_projection_benchmark(16);
+        return;
+    }
+    print("unknown command");
+    return;
+}

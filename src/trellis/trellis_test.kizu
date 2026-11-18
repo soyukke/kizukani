@@ -1,0 +1,35 @@
+import kizukani::metal;
+import std::testing;
+
+test "gpu matvec matches the cpu decode on every row" {
+    let gpu = try metal::open_default_gpu();
+    defer gpu.release();
+    let run = try run_random_matvec(&gpu, 96, 1024, 4, 1, 1);
+    testing::expect(run.worst_relative_error < 0.0001);
+}
+
+test "warp layout puts the next row's first word one quad later" {
+    testing::expect_equal<i64>(4, warp_layout_word_index(64, 1, 0, 0));
+}
+
+test "warp layout puts word four of a row after all 32 rows' first quads" {
+    testing::expect_equal<i64>(128, warp_layout_word_index(64, 0, 0, 4));
+}
+
+test "warp layout starts row 32 after the first row group's whole sequence" {
+    testing::expect_equal<i64>(6 * 128, warp_layout_word_index(64, 32, 0, 0));
+}
+
+test "the first step's state has the six bits before the sequence as zero" {
+    var words = [768]u32{};
+    let view = words.as_mut_slice();
+    view[0] = 0x3f;
+    testing::expect_equal<i64>(0xfc0, step_state(view, 32, 0, 0, 0));
+}
+
+test "a later step's state has its newest bits on top" {
+    var words = [768]u32{};
+    let view = words.as_mut_slice();
+    view[0] = 0x3f;
+    testing::expect_equal<i64>(0x03f, step_state(view, 32, 0, 0, 1));
+}

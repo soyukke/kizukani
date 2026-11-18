@@ -1,0 +1,918 @@
+import kizukani::metal;
+import kizukani::yskn;
+import std::array;
+import std::float;
+import std::fs;
+import std::io;
+import std::math;
+import std::mem;
+import std::string;
+
+pub fn draft_block_rows() -> i64 {
+    return 8;
+}
+
+pub fn draft_mask_token() -> i64 {
+    return 248070;
+}
+
+fn draft_width() -> i64 {
+    return 5120;
+}
+
+fn draft_feature_width() -> i64 {
+    return 25600;
+}
+
+fn draft_query_width() -> i64 {
+    return 4096;
+}
+
+fn draft_key_width() -> i64 {
+    return 1024;
+}
+
+fn draft_feed_forward_width() -> i64 {
+    return 17408;
+}
+
+fn draft_window_rows() -> i64 {
+    return 2048;
+}
+
+fn draft_span_rows() -> i64 {
+    return draft_window_rows() + draft_block_rows();
+}
+
+fn draft_vocabulary() -> i64 {
+    return 248320;
+}
+
+fn draft_layer_count() -> i64 {
+    return 5;
+}
+
+fn head_rank() -> i64 {
+    return 512;
+}
+
+fn shortlist_width() -> i64 {
+    return 512;
+}
+
+fn correction_rank() -> i64 {
+    return 256;
+}
+
+fn candidate_count() -> i64 {
+    return 16;
+}
+
+fn head_projection_offset() -> u64 {
+    return 24;
+}
+
+fn head_approximate_offset() -> u64 {
+    return head_projection_offset() + cast<u64>(4 * head_rank() * draft_width());
+}
+
+fn head_approximate_scale_offset() -> u64 {
+    return head_approximate_offset() + cast<u64>(draft_vocabulary() * head_rank());
+}
+
+fn head_rescore_offset() -> u64 {
+    return head_approximate_scale_offset() + cast<u64>(4 * draft_vocabulary());
+}
+
+fn head_rescore_scale_offset() -> u64 {
+    return head_rescore_offset() + cast<u64>(draft_vocabulary() * draft_width());
+}
+
+pub fn head_file_bytes() -> u64 {
+    return head_rescore_scale_offset() + cast<u64>(4 * draft_vocabulary());
+}
+
+pub struct DraftLayerRecord {
+    attention_filter: GpuLinearRecord,
+    query: GpuLinearRecord,
+    key: GpuLinearRecord,
+    value: GpuLinearRecord,
+    output: GpuLinearRecord,
+    mlp_filter: GpuLinearRecord,
+    gate: GpuLinearRecord,
+    up: GpuLinearRecord,
+    down: GpuLinearRecord,
+    input_norm: u64,
+    post_attention_norm: u64,
+    query_norm: u64,
+    key_norm: u64,
+    attention_bases: u64,
+    mlp_bases: u64,
+}
+
+pub struct DraftLayout {
+    hidden: u64,
+    normalized: u64,
+    filtered: u64,
+    attended: u64,
+    product: u64,
+    scores: u64,
+    sums: u64,
+    table: u64,
+    ring_keys: u64,
+    ring_values: u64,
+    context: u64,
+    features: u64,
+    proposal: u64,
+    low_rank: u64,
+    approximate: u64,
+    candidates: u64,
+    rescored: u64,
+    feature: u64,
+    total: u64,
+}
+
+fn draft_layout() -> DraftLayout {
+    var cursor = LayoutCursor { next: 0 };
+    let rows = draft_block_rows();
+    let hidden = cursor.take(4 * rows * draft_width());
+    let normalized = cursor.take(4 * rows * draft_width());
+    let filtered = cursor.take(4 * rows * draft_width());
+    let attended = cursor.take(4 * rows * draft_query_width());
+    let product = cursor.take(4 * rows * draft_feed_forward_width());
+    let scores = cursor.take(4 * rows * 32 * draft_span_rows());
+    let sums = cursor.take(4 * rows * 32);
+    let table = cursor.take(4 * 2 * rows * 128);
+    let ring_floats = draft_layer_count() * 8 * draft_window_rows() * 128;
+    let ring_keys = cursor.take(4 * ring_floats);
+    let ring_values = cursor.take(4 * ring_floats);
+    let context = cursor.take(4 * rows * draft_width());
+    let features = cursor.take(4 * rows * draft_feature_width());
+    let proposal = cursor.take(4 * rows * draft_width());
+    let low_rank = cursor.take(4 * rows * head_rank());
+    let approximate = cursor.take(4 * rows * draft_vocabulary());
+    let candidates = cursor.take(8 * rows * shortlist_width());
+    let rescored = cursor.take(4 * rows * shortlist_width());
+    let feature = cursor.take(4 * rows * correction_rank());
+    return DraftLayout {
+        hidden: hidden,
+        normalized: normalized,
+        filtered: filtered,
+        attended: attended,
+        product: product,
+        scores: scores,
+        sums: sums,
+        table: table,
+        ring_keys: ring_keys,
+        ring_values: ring_values,
+        context: context,
+        features: features,
+        proposal: proposal,
+        low_rank: low_rank,
+        approximate: approximate,
+        candidates: candidates,
+        rescored: rescored,
+        feature: feature,
+        total: aligned(cursor.next),
+    };
+}
+
+/// Every Metal object is retained; file_bytes and head_bytes wrap mappings the creator keeps until deinit.
+pub unsafe struct GpuDraft {
+    norm: metal::Kernel,
+    filter: metal::Kernel,
+    rope: metal::Kernel,
+    scores: metal::Kernel,
+    softmax: metal::Kernel,
+    attend: metal::Kernel,
+    glu: metal::Kernel,
+    ring_write: metal::Kernel,
+    head_project: metal::Kernel,
+    head_approximate: metal::Kernel,
+    head_rescore: metal::Kernel,
+    head_correction: metal::Kernel,
+    file_bytes: metal::Buffer,
+    constants: metal::Buffer,
+    head_bytes: metal::Buffer,
+    workspace: metal::Buffer,
+    file_byte_count: u64,
+    constant_byte_count: u64,
+    layout: DraftLayout,
+    feature_projection: GpuLinearRecord,
+    hidden_norm: u64,
+    final_norm: u64,
+    correction: u64,
+    layers: array::Array<DraftLayerRecord>,
+    predecessor_offset: i64,
+    successor_offset: i64,
+}
+
+fn draft_linear(allocator: Allocator, builder: &var ConstantsBuilder, file: []u8, file_address: u64, header: &yskn::ContainerHeader, name: []u8) -> ProjectionError!GpuLinearRecord {
+    let index = yskn::find_tensor(header, name) orelse return ModelError::MissingTensor;
+    if header.tensors.at(index) |record| {
+        let linear = try load_compressed_linear(allocator, file, file_address, record);
+        defer linear.deinit(allocator);
+        return try builder.put_linear(allocator, &linear, file_address);
+    }
+    return ModelError::MissingTensor;
+}
+
+fn draft_vector(allocator: Allocator, builder: &var ConstantsBuilder, file: []u8, header: &yskn::ContainerHeader, name: []u8) -> ProjectionError!u64 {
+    let values = try load_vector_named(allocator, file, header, name);
+    defer values.deinit(allocator);
+    return try builder.put_vector(allocator, &values);
+}
+
+fn draft_name(allocator: Allocator, layer: i64, suffix: []u8) -> mem::Error!string::String {
+    var name = string::new(allocator);
+    errdefer name.deinit(allocator);
+    try name.append_bytes(allocator, "bdraft2.layers.");
+    try name.append_byte(allocator, cast<u8>(48 + layer));
+    try name.append_byte(allocator, 46);
+    try name.append_bytes(allocator, suffix);
+    return move name;
+}
+
+fn layer_linear(allocator: Allocator, builder: &var ConstantsBuilder, file: []u8, file_address: u64, header: &yskn::ContainerHeader, layer: i64, suffix: []u8) -> ProjectionError!GpuLinearRecord {
+    let name = try draft_name(allocator, layer, suffix);
+    defer name.deinit(allocator);
+    let bytes = name.as_bytes();
+    return try draft_linear(allocator, builder, file, file_address, header, bytes);
+}
+
+fn layer_vector(allocator: Allocator, builder: &var ConstantsBuilder, file: []u8, header: &yskn::ContainerHeader, layer: i64, suffix: []u8) -> ProjectionError!u64 {
+    let name = try draft_name(allocator, layer, suffix);
+    defer name.deinit(allocator);
+    let bytes = name.as_bytes();
+    return try draft_vector(allocator, builder, file, header, bytes);
+}
+
+fn vector_offset(header: &yskn::ContainerHeader, name: []u8) -> ModelError!i64 {
+    let index = yskn::find_vector(header, name) orelse return ModelError::MissingVector;
+    if header.vectors.at(index) |record| {
+        return record.offset;
+    }
+    return ModelError::MissingVector;
+}
+
+/// draft_address and head_address start page-aligned mappings of the draft and head files that outlive the result.
+pub unsafe fn open_gpu_draft(allocator: Allocator, decoder: &GpuDecoder, draft_file: []u8, draft_address: u64, head_address: u64, head_byte_count: u64) -> !GpuDraft {
+    if head_byte_count != head_file_bytes() {
+        return ModelError::UnsupportedModel;
+    }
+    let header = try yskn::read_container_header(allocator, draft_file);
+    defer header.deinit(allocator);
+    var builder = ConstantsBuilder { bytes: string::new(allocator) };
+    defer builder.deinit(allocator);
+    let feature_projection = try draft_linear(allocator, &var builder, draft_file, draft_address, &header, "bdraft2.fc");
+    let hidden_norm = try draft_vector(allocator, &var builder, draft_file, &header, "bdraft2.hidden_norm");
+    let final_norm = try draft_vector(allocator, &var builder, draft_file, &header, "bdraft2.norm");
+    let correction = try draft_vector(allocator, &var builder, draft_file, &header, "bdraft2.sel.hp");
+    var layers = array::new<DraftLayerRecord>(allocator);
+    errdefer layers.deinit(allocator);
+    for 0..draft_layer_count() |layer| {
+        try layers.append(allocator, DraftLayerRecord {
+            attention_filter: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "akp"),
+            query: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "q"),
+            key: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "k"),
+            value: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "v"),
+            output: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "o"),
+            mlp_filter: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "mkp"),
+            gate: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "gate"),
+            up: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "up"),
+            down: try layer_linear(allocator, &var builder, draft_file, draft_address, &header, layer, "down"),
+            input_norm: try layer_vector(allocator, &var builder, draft_file, &header, layer, "ln1"),
+            post_attention_norm: try layer_vector(allocator, &var builder, draft_file, &header, layer, "ln2"),
+            query_norm: try layer_vector(allocator, &var builder, draft_file, &header, layer, "q_norm"),
+            key_norm: try layer_vector(allocator, &var builder, draft_file, &header, layer, "k_norm"),
+            attention_bases: try layer_vector(allocator, &var builder, draft_file, &header, layer, "abase"),
+            mlp_bases: try layer_vector(allocator, &var builder, draft_file, &header, layer, "mbase"),
+        });
+    }
+    let predecessor_offset = try vector_offset(&header, "bdraft2.sel.pred");
+    let successor_offset = try vector_offset(&header, "bdraft2.sel.succ");
+
+    let path = generated_kernel_path();
+    let kernel_source = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer kernel_source.deinit(allocator);
+    let gpu = &decoder.gpu;
+    let source_bytes = kernel_source.as_bytes();
+    let library = try gpu.compile_library(source_bytes);
+    defer library.release();
+    let norm = try library.kernel(gpu, c"draft_norm");
+    errdefer norm.release();
+    let filter = try library.kernel(gpu, c"draft_filter");
+    errdefer filter.release();
+    let rope = try library.kernel(gpu, c"draft_rope");
+    errdefer rope.release();
+    let scores = try library.kernel(gpu, c"draft_scores");
+    errdefer scores.release();
+    let softmax = try library.kernel(gpu, c"draft_softmax");
+    errdefer softmax.release();
+    let attend = try library.kernel(gpu, c"draft_attend");
+    errdefer attend.release();
+    let glu = try library.kernel(gpu, c"draft_glu");
+    errdefer glu.release();
+    let ring_write = try library.kernel(gpu, c"draft_ring_write");
+    errdefer ring_write.release();
+    let head_project = try library.kernel(gpu, c"head_project");
+    errdefer head_project.release();
+    let head_approximate = try library.kernel(gpu, c"head_approximate");
+    errdefer head_approximate.release();
+    let head_rescore = try library.kernel(gpu, c"head_rescore");
+    errdefer head_rescore.release();
+    let head_correction = try library.kernel(gpu, c"head_correction");
+    errdefer head_correction.release();
+    let wrapped_byte_count = rounded_up_to_page(cast<u64>(mem::len(draft_file)));
+    // SAFETY: draft_address starts a page-aligned mapping whose last page is readable to its end, kept by the caller.
+    let file_bytes = try unsafe gpu.wrap_shared_bytes(unsafe ptr_from_int<ptr<u8>>(cast<usize>(draft_address)), wrapped_byte_count);
+    errdefer file_bytes.release();
+    // SAFETY: as above for the head mapping.
+    let head_bytes = try unsafe gpu.wrap_shared_bytes(unsafe ptr_from_int<ptr<u8>>(cast<usize>(head_address)), rounded_up_to_page(head_byte_count));
+    errdefer head_bytes.release();
+    let constant_bytes = builder.bytes.as_bytes();
+    let constant_byte_count = cast<u64>(mem::len(constant_bytes));
+    let constants = try gpu.new_shared_buffer(constant_byte_count);
+    errdefer constants.release();
+    copy_into_buffer<metal::Buffer>(&constants, constant_bytes);
+    let layout = draft_layout();
+    let workspace = try gpu.new_shared_buffer(layout.total);
+    zero_workspace_range<metal::Buffer>(&workspace, 0, cast<i64>(layout.total));
+    // SAFETY: every Metal object is retained above, and the caller keeps both mappings, as the struct promises.
+    return unsafe GpuDraft {
+        norm: move norm,
+        filter: move filter,
+        rope: move rope,
+        scores: move scores,
+        softmax: move softmax,
+        attend: move attend,
+        glu: move glu,
+        ring_write: move ring_write,
+        head_project: move head_project,
+        head_approximate: move head_approximate,
+        head_rescore: move head_rescore,
+        head_correction: move head_correction,
+        file_bytes: move file_bytes,
+        constants: move constants,
+        head_bytes: move head_bytes,
+        workspace: move workspace,
+        file_byte_count: wrapped_byte_count,
+        constant_byte_count: constant_byte_count,
+        layout: layout,
+        feature_projection: feature_projection,
+        hidden_norm: hidden_norm,
+        final_norm: final_norm,
+        correction: correction,
+        layers: move layers,
+        predecessor_offset: predecessor_offset,
+        successor_offset: successor_offset,
+    };
+}
+
+pub fn (self: GpuDraft) deinit(allocator: Allocator) -> void {
+    self.layers.deinit(allocator);
+    self.workspace.release();
+    self.head_bytes.release();
+    self.constants.release();
+    self.file_bytes.release();
+    self.head_correction.release();
+    self.head_rescore.release();
+    self.head_approximate.release();
+    self.head_project.release();
+    self.ring_write.release();
+    self.glu.release();
+    self.attend.release();
+    self.softmax.release();
+    self.scores.release();
+    self.rope.release();
+    self.filter.release();
+    self.norm.release();
+    return;
+}
+
+fn bind_in<P>(pass: &P, index: u64, buffer: &metal::Buffer, total: u64, offset: u64, element_bytes: i64) -> i64 {
+    pass.bind_buffer_from(index, buffer, offset);
+    return cast<i64>(total - offset) / element_bytes;
+}
+
+fn decoder_view<P>(decoder: &GpuDecoder, pass: &P, index: u64, offset: u64, element_bytes: i64) -> i64 {
+    return bind_in<P>(pass, index, &decoder.workspace, decoder.layout.total, offset, element_bytes);
+}
+
+fn draft_view<P>(draft: &GpuDraft, pass: &P, index: u64, offset: u64, element_bytes: i64) -> i64 {
+    return bind_in<P>(pass, index, &draft.workspace, draft.layout.total, offset, element_bytes);
+}
+
+fn constant_view<P>(draft: &GpuDraft, pass: &P, index: u64, offset: u64, element_bytes: i64) -> i64 {
+    return bind_in<P>(pass, index, &draft.constants, draft.constant_byte_count, offset, element_bytes);
+}
+
+fn head_view<P>(draft: &GpuDraft, pass: &P, index: u64, offset: u64, element_bytes: i64) -> i64 {
+    return bind_in<P>(pass, index, &draft.head_bytes, head_file_bytes(), offset, element_bytes);
+}
+
+fn finish_draft_kernel<P>(decoder: &GpuDecoder, pass: &P, index: u64, lengths: []i64) -> void {
+    bind_lengths<P>(pass, index, lengths);
+    pass.bind_buffer(index + 1, &decoder.status);
+    return;
+}
+
+fn slot_offset(decoder: &GpuDecoder, slot: i64) -> u64 {
+    return projected_slot<GpuDecoder>(decoder, slot);
+}
+
+fn encode_draft_linear<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P, linear: &GpuLinearRecord, input: u64, input_stride: i64, slot: i64, rows: i64) -> void {
+    let prepare_lengths = [8]i64{
+        draft_view<P>(draft, pass, 0, input, 4),
+        constant_view<P>(draft, pass, 1, 0, 4),
+        constant_view<P>(draft, pass, 2, linear.input_sign_offset, 1),
+        decoder_view<P>(decoder, pass, 3, decoder.layout.activation, 1),
+        decoder_view<P>(decoder, pass, 4, decoder.layout.scalars, 4),
+        decoder_view<P>(decoder, pass, 5, decoder.layout.weighted_bf16, 4),
+        decoder_view<P>(decoder, pass, 6, decoder.layout.activation_halves, 2),
+        decoder_view<P>(decoder, pass, 7, decoder.layout.block_scales, 4)
+    };
+    bind_i64<P>(pass, 8, linear.cols);
+    bind_u32<P>(pass, 9, 0);
+    bind_i64<P>(pass, 10, input_stride);
+    let prepare_view = prepare_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 11, prepare_view);
+    pass.dispatch_threadgroups(&decoder.prepare, cast<u64>(rows * (linear.cols / 512)), 512);
+    encode_activation_finish<GpuDecoder, P>(decoder, pass, linear.cols, rows);
+    let threadgroup_width = cast<u64>(32 * linear_sums_simdgroups_per_row_group());
+    let threadgroup_count = cast<u64>(linear.physical_rows / 32);
+    let sum_lengths = [5]i64{
+        bind_in<P>(pass, 0, &draft.file_bytes, draft.file_byte_count, linear.code_offset, 4),
+        constant_view<P>(draft, pass, 1, linear.table_offset, 2),
+        decoder_view<P>(decoder, pass, 2, decoder.layout.activation_halves, 4),
+        decoder_view<P>(decoder, pass, 3, decoder.layout.batch_block_weights, 8),
+        decoder_view<P>(decoder, pass, 4, row_sum_slot<GpuDecoder>(decoder, slot), 8)
+    };
+    bind_i64<P>(pass, 5, linear.physical_rows);
+    bind_i64<P>(pass, 6, linear.cols / 256);
+    bind_i64<P>(pass, 7, rows);
+    bind_i64<P>(pass, 8, projection_slot_values());
+    let sum_view = sum_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 9, sum_view);
+    pass.dispatch_threadgroups(&decoder.eight_bit_batch_sums, threadgroup_count, threadgroup_width);
+    let restore_lengths = [5]i64{
+        decoder_view<P>(decoder, pass, 0, row_sum_slot<GpuDecoder>(decoder, slot), 8),
+        constant_view<P>(draft, pass, 1, linear.scale_offset, 4),
+        constant_view<P>(draft, pass, 2, linear.output_sign_offset, 1),
+        decoder_view<P>(decoder, pass, 3, decoder.layout.scalars, 4),
+        decoder_view<P>(decoder, pass, 4, slot_offset(decoder, slot), 4)
+    };
+    let groups_per_token = cast<i64>(threadgroups_for(linear.physical_rows, 512));
+    bind_i64<P>(pass, 5, linear.physical_rows);
+    bind_i64<P>(pass, 6, linear.rows);
+    bind_u32<P>(pass, 7, 0);
+    bind_i64<P>(pass, 8, groups_per_token);
+    let restore_view = restore_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 9, restore_view);
+    pass.dispatch_threadgroups(&decoder.restore, cast<u64>(groups_per_token * rows), 512);
+    return;
+}
+
+fn encode_draft_norm<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P, input: u64, weight: u64, output: u64, rows: i64) -> void {
+    let lengths = [3]i64{
+        draft_view<P>(draft, pass, 0, input, 4),
+        constant_view<P>(draft, pass, 1, weight, 4),
+        draft_view<P>(draft, pass, 2, output, 4)
+    };
+    bind_i64<P>(pass, 3, draft_width());
+    bind_i64<P>(pass, 4, draft_width());
+    bind_i64<P>(pass, 5, draft_width());
+    let length_view = lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 6, length_view);
+    pass.dispatch_threadgroups(&draft.norm, cast<u64>(rows), 256);
+    return;
+}
+
+fn encode_draft_filter<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P, source: u64, source_in_decoder: bool, bases: u64, target: u64, branch: i64, accumulate: bool) -> void {
+    var source_length: i64 = 0;
+    var source_stride = draft_width();
+    if source_in_decoder {
+        source_length = decoder_view<P>(decoder, pass, 0, source, 4);
+        source_stride = projection_slot_values();
+    } else {
+        source_length = draft_view<P>(draft, pass, 0, source, 4);
+    }
+    let lengths = [4]i64{
+        source_length,
+        decoder_view<P>(decoder, pass, 1, slot_offset(decoder, 0), 4),
+        constant_view<P>(draft, pass, 2, bases, 4),
+        draft_view<P>(draft, pass, 3, target, 4)
+    };
+    var accumulate_word: u32 = 0;
+    if accumulate {
+        accumulate_word = 1;
+    }
+    bind_i64<P>(pass, 4, branch);
+    bind_u32<P>(pass, 5, accumulate_word);
+    bind_i64<P>(pass, 6, source_stride);
+    bind_i64<P>(pass, 7, projection_slot_values());
+    bind_i64<P>(pass, 8, draft_width());
+    bind_i64<P>(pass, 9, draft_block_rows());
+    let length_view = lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 10, length_view);
+    pass.dispatch_threadgroups(&draft.filter, threadgroups_for(draft_block_rows() * draft_width(), 256), 256);
+    return;
+}
+
+fn encode_draft_rope<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P, slot: i64, weight: u64, heads: i64, rows: i64, table_row: i64) -> void {
+    let lengths = [3]i64{
+        decoder_view<P>(decoder, pass, 0, slot_offset(decoder, slot), 4),
+        constant_view<P>(draft, pass, 1, weight, 4),
+        draft_view<P>(draft, pass, 2, draft.layout.table + cast<u64>(4 * 128 * table_row), 4)
+    };
+    bind_i64<P>(pass, 3, heads);
+    bind_i64<P>(pass, 4, projection_slot_values());
+    let length_view = lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 5, length_view);
+    pass.dispatch_threadgroups(&draft.rope, cast<u64>(rows * heads), 128);
+    return;
+}
+
+fn ring_offset(draft: &GpuDraft, layer: i64, values: bool) -> u64 {
+    var first = draft.layout.ring_keys;
+    if values {
+        first = draft.layout.ring_values;
+    }
+    return first + cast<u64>(4 * layer * 8 * draft_window_rows() * 128);
+}
+
+fn encode_draft_attention<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P, layer: i64, position: i64) -> void {
+    var history_start = position - (draft_window_rows() - 1);
+    if history_start < 0 {
+        history_start = 0;
+    }
+    let history_count = position - history_start;
+    let score_lengths = [4]i64{
+        decoder_view<P>(decoder, pass, 0, slot_offset(decoder, 1), 4),
+        decoder_view<P>(decoder, pass, 1, slot_offset(decoder, 2), 4),
+        draft_view<P>(draft, pass, 2, ring_offset(draft, layer, false), 4),
+        draft_view<P>(draft, pass, 3, draft.layout.scores, 4)
+    };
+    bind_i64<P>(pass, 4, position);
+    bind_i64<P>(pass, 5, history_start);
+    bind_i64<P>(pass, 6, history_count);
+    bind_i64<P>(pass, 7, projection_slot_values());
+    bind_i64<P>(pass, 8, projection_slot_values());
+    let score_view = score_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 9, score_view);
+    pass.dispatch_threadgroups(&draft.scores, threadgroups_for(draft_block_rows() * 32 * (history_count + draft_block_rows()), 256), 256);
+    let softmax_lengths = [2]i64{
+        draft_view<P>(draft, pass, 0, draft.layout.scores, 4),
+        draft_view<P>(draft, pass, 1, draft.layout.sums, 4)
+    };
+    bind_i64<P>(pass, 2, history_count);
+    let softmax_view = softmax_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 3, softmax_view);
+    pass.dispatch_threadgroups(&draft.softmax, 4, 64);
+    let attend_lengths = [5]i64{
+        draft_view<P>(draft, pass, 0, draft.layout.scores, 4),
+        draft_view<P>(draft, pass, 1, draft.layout.sums, 4),
+        draft_view<P>(draft, pass, 2, ring_offset(draft, layer, true), 4),
+        decoder_view<P>(decoder, pass, 3, slot_offset(decoder, 3), 4),
+        draft_view<P>(draft, pass, 4, draft.layout.attended, 4)
+    };
+    bind_i64<P>(pass, 5, history_start);
+    bind_i64<P>(pass, 6, history_count);
+    bind_i64<P>(pass, 7, projection_slot_values());
+    bind_i64<P>(pass, 8, draft_query_width());
+    let attend_view = attend_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 9, attend_view);
+    pass.dispatch_threadgroups(&draft.attend, cast<u64>(draft_block_rows() * 32), 128);
+    return;
+}
+
+fn encode_draft_glu<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P) -> void {
+    let lengths = [3]i64{
+        decoder_view<P>(decoder, pass, 0, slot_offset(decoder, 1), 4),
+        decoder_view<P>(decoder, pass, 1, slot_offset(decoder, 2), 4),
+        draft_view<P>(draft, pass, 2, draft.layout.product, 4)
+    };
+    bind_i64<P>(pass, 3, draft_feed_forward_width());
+    bind_i64<P>(pass, 4, projection_slot_values());
+    bind_i64<P>(pass, 5, draft_feed_forward_width());
+    let length_view = lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 6, length_view);
+    pass.dispatch_threadgroups(&draft.glu, threadgroups_for(draft_block_rows() * draft_feed_forward_width(), 256), 256);
+    return;
+}
+
+fn encode_draft_block<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P, position: i64, table_row: i64) -> void {
+    let rows = draft_block_rows();
+    for 0..draft_layer_count() |layer_index| {
+        if draft.layers.at(layer_index) |layer| {
+            encode_draft_norm<P>(decoder, draft, pass, draft.layout.hidden, layer.input_norm, draft.layout.normalized, rows);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.attention_filter, draft.layout.normalized, draft_width(), 0, rows);
+            encode_draft_filter<P>(decoder, draft, pass, draft.layout.normalized, false, layer.attention_bases, draft.layout.filtered, 0, false);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.query, draft.layout.filtered, draft_width(), 1, rows);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.key, draft.layout.filtered, draft_width(), 2, rows);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.value, draft.layout.filtered, draft_width(), 3, rows);
+            encode_draft_rope<P>(decoder, draft, pass, 1, layer.query_norm, 32, rows, table_row);
+            encode_draft_rope<P>(decoder, draft, pass, 2, layer.key_norm, 8, rows, table_row);
+            encode_draft_attention<P>(decoder, draft, pass, layer_index, position);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.output, draft.layout.attended, draft_query_width(), 1, rows);
+            encode_draft_filter<P>(decoder, draft, pass, slot_offset(decoder, 1), true, layer.attention_bases, draft.layout.hidden, 1, true);
+            encode_draft_norm<P>(decoder, draft, pass, draft.layout.hidden, layer.post_attention_norm, draft.layout.normalized, rows);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.mlp_filter, draft.layout.normalized, draft_width(), 0, rows);
+            encode_draft_filter<P>(decoder, draft, pass, draft.layout.normalized, false, layer.mlp_bases, draft.layout.filtered, 0, false);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.gate, draft.layout.filtered, draft_width(), 1, rows);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.up, draft.layout.filtered, draft_width(), 2, rows);
+            encode_draft_glu<P>(decoder, draft, pass);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.down, draft.layout.product, draft_feed_forward_width(), 3, rows);
+            encode_draft_filter<P>(decoder, draft, pass, slot_offset(decoder, 3), true, layer.mlp_bases, draft.layout.hidden, 1, true);
+        }
+    }
+    encode_draft_norm<P>(decoder, draft, pass, draft.layout.hidden + cast<u64>(4 * draft_width()), draft.final_norm, draft.layout.proposal, rows - 1);
+    let project_lengths = [3]i64{
+        draft_view<P>(draft, pass, 0, draft.layout.proposal, 4),
+        head_view<P>(draft, pass, 1, head_projection_offset(), 4),
+        draft_view<P>(draft, pass, 2, draft.layout.low_rank, 4)
+    };
+    bind_i64<P>(pass, 3, rows - 1);
+    let project_view = project_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 4, project_view);
+    pass.dispatch_threadgroups(&draft.head_project, threadgroups_for((rows - 1) * head_rank(), 256), 256);
+    let approximate_lengths = [4]i64{
+        draft_view<P>(draft, pass, 0, draft.layout.low_rank, 4),
+        head_view<P>(draft, pass, 1, head_approximate_offset(), 1),
+        head_view<P>(draft, pass, 2, head_approximate_scale_offset(), 4),
+        draft_view<P>(draft, pass, 3, draft.layout.approximate, 4)
+    };
+    bind_i64<P>(pass, 4, draft_vocabulary());
+    bind_i64<P>(pass, 5, rows - 1);
+    let approximate_view = approximate_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 6, approximate_view);
+    pass.dispatch_threadgroups(&draft.head_approximate, threadgroups_for(draft_vocabulary(), 256), 256);
+    return;
+}
+
+fn encode_draft_head<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P) -> void {
+    let rows = draft_block_rows() - 1;
+    let rescore_lengths = [5]i64{
+        draft_view<P>(draft, pass, 0, draft.layout.proposal, 4),
+        draft_view<P>(draft, pass, 1, draft.layout.candidates, 8),
+        head_view<P>(draft, pass, 2, head_rescore_offset(), 1),
+        head_view<P>(draft, pass, 3, head_rescore_scale_offset(), 4),
+        draft_view<P>(draft, pass, 4, draft.layout.rescored, 4)
+    };
+    bind_i64<P>(pass, 5, rows);
+    let rescore_view = rescore_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 6, rescore_view);
+    pass.dispatch_threadgroups(&draft.head_rescore, threadgroups_for(rows * shortlist_width(), 256), 256);
+    let correction_lengths = [3]i64{
+        draft_view<P>(draft, pass, 0, draft.layout.proposal, 4),
+        constant_view<P>(draft, pass, 1, draft.correction, 4),
+        draft_view<P>(draft, pass, 2, draft.layout.feature, 4)
+    };
+    bind_i64<P>(pass, 3, rows);
+    let correction_view = correction_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 4, correction_view);
+    pass.dispatch_threadgroups(&draft.head_correction, threadgroups_for(rows * correction_rank(), 256), 256);
+    return;
+}
+
+fn encode_draft_context<P>(decoder: &GpuDecoder, draft: &GpuDraft, pass: &P, position: i64, rows: i64) -> void {
+    let feature_lengths = [2]i64{
+        decoder_view<P>(decoder, pass, 0, decoder.layout.capture, 4),
+        draft_view<P>(draft, pass, 1, draft.layout.features, 4)
+    };
+    bind_i64<P>(pass, 2, draft_feature_width());
+    bind_i64<P>(pass, 3, draft_feature_width());
+    bind_i64<P>(pass, 4, draft_feature_width());
+    bind_i64<P>(pass, 5, rows);
+    let feature_view = feature_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 6, feature_view);
+    pass.dispatch_threadgroups(&decoder.copy_rows, threadgroups_for(rows * draft_feature_width(), 256), 256);
+    encode_draft_linear<P>(decoder, draft, pass, &draft.feature_projection, draft.layout.features, draft_feature_width(), 0, rows);
+    let copy_lengths = [2]i64{
+        decoder_view<P>(decoder, pass, 0, slot_offset(decoder, 0), 4),
+        draft_view<P>(draft, pass, 1, draft.layout.normalized, 4)
+    };
+    bind_i64<P>(pass, 2, draft_width());
+    bind_i64<P>(pass, 3, projection_slot_values());
+    bind_i64<P>(pass, 4, draft_width());
+    bind_i64<P>(pass, 5, rows);
+    let copy_view = copy_lengths.as_slice();
+    finish_draft_kernel<P>(decoder, pass, 6, copy_view);
+    pass.dispatch_threadgroups(&decoder.copy_rows, threadgroups_for(rows * draft_width(), 256), 256);
+    encode_draft_norm<P>(decoder, draft, pass, draft.layout.normalized, draft.hidden_norm, draft.layout.context, rows);
+    for 0..draft_layer_count() |layer_index| {
+        if draft.layers.at(layer_index) |layer| {
+            encode_draft_linear<P>(decoder, draft, pass, &layer.key, draft.layout.context, draft_width(), 2, rows);
+            encode_draft_linear<P>(decoder, draft, pass, &layer.value, draft.layout.context, draft_width(), 3, rows);
+            encode_draft_rope<P>(decoder, draft, pass, 2, layer.key_norm, 8, rows, 0);
+            let write_lengths = [4]i64{
+                decoder_view<P>(decoder, pass, 0, slot_offset(decoder, 2), 4),
+                decoder_view<P>(decoder, pass, 1, slot_offset(decoder, 3), 4),
+                draft_view<P>(draft, pass, 2, ring_offset(draft, layer_index, false), 4),
+                draft_view<P>(draft, pass, 3, ring_offset(draft, layer_index, true), 4)
+            };
+            bind_i64<P>(pass, 4, position);
+            bind_i64<P>(pass, 5, rows);
+            bind_i64<P>(pass, 6, projection_slot_values());
+            let write_view = write_lengths.as_slice();
+            finish_draft_kernel<P>(decoder, pass, 7, write_view);
+            pass.dispatch_threadgroups(&draft.ring_write, threadgroups_for(rows * draft_key_width(), 256), 256);
+        }
+    }
+    return;
+}
+
+fn draft_address(draft: &GpuDraft, offset: u64) -> usize {
+    // SAFETY: reading an address as an integer touches no memory.
+    return unsafe int_from_ptr<usize>(draft.workspace.contents()) + cast<usize>(offset);
+}
+
+fn write_rope_table(draft: &GpuDraft, position: i64, rows: i64) -> void {
+    // SAFETY: the table holds 128 floats for each of twice the block rows, rows is at most that, and no GPU work is in flight.
+    let table = unsafe mut_view_from_ptr(unsafe ptr_from_int<ptr<f32>>(draft_address(draft, draft.layout.table)), rows * 128);
+    for 0..rows |row| {
+        for 0..64 |pair| {
+            let exponent = (-cast<f32>(2 * pair) / cast<f32>(128.0)) * cast<f32>(23.253496664211536);
+            let frequency = cast<f32>(math::exp2<f64>(cast<f64>(exponent)));
+            let angle = cast<f32>(position + row) * frequency;
+            table[row * 128 + pair] = cast<f32>(math::cos<f64>(cast<f64>(angle)));
+            table[row * 128 + 64 + pair] = cast<f32>(math::sin<f64>(cast<f64>(angle)));
+        }
+    }
+    return;
+}
+
+/// Adds the captured main rows of the last run, which sit at position.., to the draft's context ring.
+pub fn (self: &GpuDraft) push_context(decoder: &GpuDecoder, position: i64, rows: i64) -> !void {
+    if rows < 1 or rows > draft_block_rows() {
+        return ModelError::ShapeMismatch;
+    }
+    write_rope_table(self, position, rows);
+    let pass = try decoder.gpu.begin_compute_pass();
+    encode_draft_context<metal::ComputePass>(decoder, self, &pass, position, rows);
+    try pass.finish();
+    if status_word<GpuDecoder>(decoder) != 0 {
+        return ModelError::KernelFailed;
+    }
+    return;
+}
+
+fn ordered_key(value: f32) -> u32 {
+    let bits = float::bits_f32(value);
+    if (bits & 0x80000000) != 0 {
+        return ~bits;
+    }
+    return bits | 0x80000000;
+}
+
+fn shortlist_row(scores: []f32, out: &var []i64, first: i64) -> void {
+    let vocabulary = mem::count<f32>(scores);
+    var bins = [4096]i64{};
+    let bin_view = bins.as_mut_slice();
+    for 0..vocabulary |token| {
+        let bin = cast<i64>(ordered_key(scores[token]) >> 20);
+        bin_view[bin] = bin_view[bin] + 1;
+    }
+    var cutoff: i64 = 4095;
+    var above: i64 = 0;
+    while cutoff > 0 and above + bin_view[cutoff] < shortlist_width() {
+        above = above + bin_view[cutoff];
+        cutoff = cutoff - 1;
+    }
+    var filled: i64 = 0;
+    for 0..vocabulary |token| {
+        if cast<i64>(ordered_key(scores[token]) >> 20) > cutoff {
+            out[first + filled] = token;
+            filled = filled + 1;
+        }
+    }
+    var keys = [4096]u32{};
+    let key_view = keys.as_mut_slice();
+    var tokens = [4096]i64{};
+    let token_view = tokens.as_mut_slice();
+    var gathered: i64 = 0;
+    for 0..vocabulary |token| {
+        let key = ordered_key(scores[token]);
+        if cast<i64>(key >> 20) == cutoff and gathered < 4096 {
+            key_view[gathered] = key;
+            token_view[gathered] = token;
+            gathered = gathered + 1;
+        }
+    }
+    while filled < shortlist_width() and gathered > 0 {
+        var best: i64 = 0;
+        for 1..gathered |index| {
+            if key_view[index] > key_view[best] {
+                best = index;
+            }
+        }
+        out[first + filled] = token_view[best];
+        filled = filled + 1;
+        gathered = gathered - 1;
+        key_view[best] = key_view[gathered];
+        token_view[best] = token_view[gathered];
+    }
+    return;
+}
+
+fn bf16_at(file: []u8, offset: i64) -> f32 {
+    let bits = cast<u16>(yskn::read_little_endian(file, offset, 2));
+    return yskn::bf16_to_f32(bits);
+}
+
+/// Pushes the context_rows captured rows before position, then proposes draft_block_rows() - 1 tokens after frontier, whose input position is position.
+pub fn (self: &GpuDraft) propose(decoder: &GpuDecoder, draft_file: []u8, frontier_embedding: []f32, mask_embedding: []f32, frontier: i64, position: i64, context_rows: i64, out: &var []i64) -> !void {
+    if context_rows < 0 or context_rows > draft_block_rows() {
+        return ModelError::ShapeMismatch;
+    }
+    let rows = draft_block_rows();
+    let width = draft_width();
+    // SAFETY: the hidden rows hold rows * width floats, and no GPU work is in flight.
+    let hidden = unsafe mut_view_from_ptr(unsafe ptr_from_int<ptr<f32>>(draft_address(self, self.layout.hidden)), rows * width);
+    for 0..width |index| {
+        hidden[index] = frontier_embedding[index];
+    }
+    for 1..rows |row| {
+        for 0..width |index| {
+            hidden[row * width + index] = mask_embedding[index];
+        }
+    }
+    write_rope_table(self, position - context_rows, context_rows + rows);
+    let pass = try decoder.gpu.begin_compute_pass();
+    if context_rows > 0 {
+        encode_draft_context<metal::ComputePass>(decoder, self, &pass, position - context_rows, context_rows);
+    }
+    encode_draft_block<metal::ComputePass>(decoder, self, &pass, position, context_rows);
+    try pass.finish();
+    if status_word<GpuDecoder>(decoder) != 0 {
+        return ModelError::KernelFailed;
+    }
+    let proposals = rows - 1;
+    let vocabulary = draft_vocabulary();
+    // SAFETY: the approximate scores hold proposals * vocabulary floats, and the pass finished.
+    let approximate = unsafe view_from_ptr(unsafe ptr_from_int<ptr<const f32>>(draft_address(self, self.layout.approximate)), proposals * vocabulary);
+    // SAFETY: the candidate rows hold proposals * shortlist_width() ids, and no GPU work is in flight.
+    let candidates = unsafe mut_view_from_ptr(unsafe ptr_from_int<ptr<i64>>(draft_address(self, self.layout.candidates)), proposals * shortlist_width());
+    for 0..proposals |row| {
+        let row_scores = approximate[row * vocabulary..(row + 1) * vocabulary];
+        shortlist_row(row_scores, &var candidates, row * shortlist_width());
+    }
+    let head_pass = try decoder.gpu.begin_compute_pass();
+    encode_draft_head<metal::ComputePass>(decoder, self, &head_pass);
+    try head_pass.finish();
+    if status_word<GpuDecoder>(decoder) != 0 {
+        return ModelError::KernelFailed;
+    }
+    // SAFETY: the rescored rows hold proposals * shortlist_width() floats, and the pass finished.
+    let rescored = unsafe view_from_ptr(unsafe ptr_from_int<ptr<const f32>>(draft_address(self, self.layout.rescored)), proposals * shortlist_width());
+    // SAFETY: the feature rows hold proposals * correction_rank() floats, and the pass finished.
+    let feature = unsafe view_from_ptr(unsafe ptr_from_int<ptr<const f32>>(draft_address(self, self.layout.feature)), proposals * correction_rank());
+    var predecessor = frontier;
+    for 0..proposals |row| {
+        var top = [16]i64{};
+        let top_view = top.as_mut_slice();
+        var top_scores = [16]f32{};
+        let top_score_view = top_scores.as_mut_slice();
+        for 0..candidate_count() |rank| {
+            var best: i64 = -1;
+            for 0..shortlist_width() |index| {
+                let at = row * shortlist_width() + index;
+                var taken = false;
+                for 0..rank |earlier| {
+                    if top_view[earlier] == at {
+                        taken = true;
+                    }
+                }
+                if !taken {
+                    if best < 0 or rescored[at] > rescored[best] or (rescored[at] == rescored[best] and candidates[at] < candidates[best]) {
+                        best = at;
+                    }
+                }
+            }
+            top_view[rank] = best;
+            top_score_view[rank] = rescored[best];
+        }
+        var product = [256]f32{};
+        let product_view = product.as_mut_slice();
+        for 0..correction_rank() |rank| {
+            product_view[rank] = bf16_at(draft_file, self.predecessor_offset + 2 * (predecessor * correction_rank() + rank)) * feature[row * correction_rank() + rank];
+        }
+        var chosen: i64 = -1;
+        var chosen_score: f32 = 0.0;
+        for 0..candidate_count() |rank| {
+            let token = candidates[top_view[rank]];
+            var correction: f32 = 0.0;
+            for 0..correction_rank() |index| {
+                correction = correction + product_view[index] * bf16_at(draft_file, self.successor_offset + 2 * (token * correction_rank() + index));
+            }
+            let score = top_score_view[rank] + correction;
+            if chosen < 0 or score > chosen_score {
+                chosen = token;
+                chosen_score = score;
+            }
+        }
+        out[row] = chosen;
+        predecessor = chosen;
+    }
+    return;
+}

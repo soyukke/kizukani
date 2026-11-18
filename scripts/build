@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p target
+scripts/kizu build --target metal --opt -o target/kernels.metal .
+scripts/kizu build --target native --opt -o target/kizukani .

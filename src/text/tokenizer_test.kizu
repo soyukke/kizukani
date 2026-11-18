@@ -1,0 +1,26 @@
+import std::fs;
+import std::io;
+import std::mem;
+import std::testing;
+
+test "the tokenizer matches the reference ids and text on the fixture" {
+    let allocator = mem::page_allocator();
+    let tokenizer = try load_tokenizer(allocator, "data/unicode_tables.bin", "models/qwen38-27b-speed/tokenizer.json");
+    defer tokenizer.deinit(allocator);
+    let path = "testdata/text/tokenizer_cases.txt";
+    let fixture = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer fixture.deinit(allocator);
+    let fixture_bytes = fixture.as_bytes();
+    testing::expect_equal<i64>(0, try tokenizer.count_fixture_mismatches(allocator, fixture_bytes));
+}
+
+test "the chat prompts match the reference template on the fixture" {
+    let allocator = mem::page_allocator();
+    let tokenizer = try load_tokenizer(allocator, "data/unicode_tables.bin", "models/qwen38-27b-speed/tokenizer.json");
+    defer tokenizer.deinit(allocator);
+    let path = "testdata/text/chat_cases.txt";
+    let fixture = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer fixture.deinit(allocator);
+    let fixture_bytes = fixture.as_bytes();
+    testing::expect_equal<i64>(0, try tokenizer.count_chat_mismatches(allocator, fixture_bytes));
+}

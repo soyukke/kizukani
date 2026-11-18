@@ -1,0 +1,406 @@
+import std::gpu;
+
+export "gpu" fn compressed_linear_row_sums_six(
+    code_words: []u32,
+    weight_pairs: []u16,
+    activation_bytes: []i8,
+    block_weights: []i64,
+    row_sums: &var []i64,
+    physical_rows: i64,
+    sequences: i64
+) -> void {
+    var weight_storage = gpu::group_array<[4096]u32>();
+    var weights = weight_storage.as_mut_slice();
+    load_weights(weight_pairs, &var weights);
+    let lane = gpu::lane_index();
+    let row_group = gpu::group_index();
+    let row_groups = physical_rows / 32;
+    var row_total: i64 = 0;
+    var sequence = gpu::simdgroup_index();
+    while sequence < sequences {
+        let first_word = (sequence * row_groups + row_group) * 768 + lane * 4;
+        let words = code_words[first_word..first_word + 644];
+        let first_input = sequence * 256;
+        let inputs = activation_bytes[first_input..first_input + 256];
+        let block_weight = block_weights[cast<i64>(cast<u32>(sequence) >> 1)];
+        var dot: f32 = 0.0;
+        dot = six_group<i8>(&weights, words, inputs, 0, dot);
+        dot = six_group<i8>(&weights, words, inputs, 1, dot);
+        dot = six_group<i8>(&weights, words, inputs, 2, dot);
+        dot = six_group<i8>(&weights, words, inputs, 3, dot);
+        dot = six_group<i8>(&weights, words, inputs, 4, dot);
+        dot = six_group<i8>(&weights, words, inputs, 5, dot);
+        dot = six_group<i8>(&weights, words, inputs, 6, dot);
+        dot = six_group<i8>(&weights, words, inputs, 7, dot);
+        row_total = row_total + block_weight * cast<i64>(cast<i32>(dot));
+        sequence = sequence + 4;
+    }
+    store_row_sums(row_sums, &var weights, row_total);
+    return;
+}
+
+export "gpu" fn compressed_linear_row_sums_eight(
+    code_words: []u32,
+    weight_pairs: []u16,
+    activation_bytes: []i8,
+    block_weights: []i64,
+    row_sums: &var []i64,
+    physical_rows: i64,
+    sequences: i64
+) -> void {
+    var weight_storage = gpu::group_array<[4096]u32>();
+    var weights = weight_storage.as_mut_slice();
+    load_weights(weight_pairs, &var weights);
+    let lane = gpu::lane_index();
+    let row_group = gpu::group_index();
+    let row_groups = physical_rows / 32;
+    var row_total: i64 = 0;
+    var sequence = gpu::simdgroup_index();
+    while sequence < sequences {
+        let first_word = (sequence * row_groups + row_group) * 1024 + lane * 4;
+        let words = code_words[first_word..first_word + 900];
+        let first_input = sequence * 256;
+        let inputs = activation_bytes[first_input..first_input + 256];
+        let block_weight = block_weights[cast<i64>(cast<u32>(sequence) >> 1)];
+        var dot: f32 = 0.0;
+        dot = eight_word<i8>(&weights, words, inputs, 0, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 1, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 2, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 3, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 4, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 5, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 6, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 7, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 8, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 9, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 10, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 11, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 12, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 13, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 14, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 15, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 16, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 17, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 18, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 19, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 20, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 21, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 22, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 23, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 24, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 25, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 26, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 27, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 28, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 29, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 30, dot);
+        dot = eight_word<i8>(&weights, words, inputs, 31, dot);
+        row_total = row_total + block_weight * cast<i64>(cast<i32>(dot));
+        sequence = sequence + 4;
+    }
+    store_row_sums(row_sums, &var weights, row_total);
+    return;
+}
+
+fn six_group<T>(weights: &[]u32, words: []u32, inputs: []T, group: i64, sum: f32) -> f32 {
+    var previous: u32 = 0;
+    if group > 0 {
+        previous = words[code_offset(group * 3 - 1)];
+    }
+    let first = words[code_offset(group * 3)];
+    let second = words[code_offset(group * 3 + 1)];
+    let third = words[code_offset(group * 3 + 2)];
+    let at = group * 32;
+    var dot = sum;
+    dot = step_dot<T>(weights, inputs, at, (previous >> 26) | ((first & 0x3f) << 6), dot);
+    dot = step_dot<T>(weights, inputs, at + 2, first & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 4, (first >> 6) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 6, (first >> 12) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 8, (first >> 18) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 10, (first >> 24) | ((second & 0xf) << 8), dot);
+    dot = step_dot<T>(weights, inputs, at + 12, (first >> 30) | ((second & 0x3ff) << 2), dot);
+    dot = step_dot<T>(weights, inputs, at + 14, (second >> 4) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 16, (second >> 10) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 18, (second >> 16) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 20, (second >> 22) | ((third & 0x3) << 10), dot);
+    dot = step_dot<T>(weights, inputs, at + 22, (second >> 28) | ((third & 0xff) << 4), dot);
+    dot = step_dot<T>(weights, inputs, at + 24, (third >> 2) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 26, (third >> 8) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 28, (third >> 14) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 30, (third >> 20) & 0xfff, dot);
+    return dot;
+}
+
+fn eight_word<T>(weights: &[]u32, words: []u32, inputs: []T, word: i64, sum: f32) -> f32 {
+    var previous: u32 = 0;
+    if word > 0 {
+        previous = words[code_offset(word - 1)];
+    }
+    let current = words[code_offset(word)];
+    let at = word * 8;
+    var dot = sum;
+    dot = step_dot<T>(weights, inputs, at, (previous >> 28) | ((current & 0xff) << 4), dot);
+    dot = step_dot<T>(weights, inputs, at + 2, (current >> 4) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 4, (current >> 12) & 0xfff, dot);
+    dot = step_dot<T>(weights, inputs, at + 6, (current >> 20) & 0xfff, dot);
+    return dot;
+}
+
+fn code_offset(word: i64) -> i64 {
+    return (word >> 2) * 128 + (word & 3);
+}
+
+fn load_weights(weight_pairs: []u16, weights: &var []u32) -> void {
+    var pair = gpu::local_index();
+    while pair < 4096 {
+        let bits = cast<i32>(weight_pairs[pair]);
+        let low = cast<u32>(gpu::half_from_f32(cast<f32>((bits << 24) >> 24)));
+        let high = cast<u32>(gpu::half_from_f32(cast<f32>((bits << 16) >> 24)));
+        weights[pair] = low | (high << 16);
+        pair = pair + 128;
+    }
+    gpu::barrier();
+    return;
+}
+
+fn step_dot<T>(weights: &[]u32, inputs: []T, at: i64, state: u32, sum: f32) -> f32 {
+    let weight_pair = weights[cast<i64>(state)];
+    let first = gpu::f32_from_half(cast<u16>(weight_pair & 0xffff));
+    let second = gpu::f32_from_half(cast<u16>(weight_pair >> 16));
+    let partial = gpu::fma(first, cast<f32>(inputs[at]), sum);
+    return gpu::fma(second, cast<f32>(inputs[at + 1]), partial);
+}
+
+fn store_row_sums(row_sums: &var []i64, cells: &var []u32, row_total: i64) -> void {
+    let lane = gpu::lane_index();
+    let simdgroup = gpu::simdgroup_index();
+    gpu::barrier();
+    let slot = (simdgroup * 32 + lane) * 2;
+    let bits = cast<u64>(row_total);
+    cells[slot] = cast<u32>(bits & 0xffffffff);
+    cells[slot + 1] = cast<u32>(bits >> 32);
+    gpu::barrier();
+    if simdgroup == 0 {
+        var total: i64 = 0;
+        for 0..4 |other| {
+            let from = (other * 32 + lane) * 2;
+            let value = cast<u64>(cells[from]) | (cast<u64>(cells[from + 1]) << 32);
+            total = total + cast<i64>(value);
+        }
+        row_sums[gpu::group_index() * 32 + lane] = total;
+    }
+    return;
+}
+
+export "gpu" fn compressed_linear_row_sums_six_batch(
+    code_words: []u32,
+    weight_pairs: []u16,
+    activation_pairs: []u32,
+    block_weights: []i64,
+    row_sums: &var []i64,
+    physical_rows: i64,
+    sequences: i64,
+    batch: i64,
+    sum_stride: i64
+) -> void {
+    var weight_storage = gpu::group_array<[4096]u32>();
+    var weights = weight_storage.as_mut_slice();
+    load_weights(weight_pairs, &var weights);
+    let lane = gpu::lane_index();
+    let row_group = gpu::group_index();
+    let row_groups = physical_rows / 32;
+    var totals = [8]i64{};
+    var sequence = gpu::simdgroup_index();
+    while sequence < sequences {
+        let first_block = cast<i64>(cast<u32>(sequence) >> 1) * batch_capacity();
+        let block_weight_view = block_weights[first_block..first_block + 8];
+        let first_word = (sequence * row_groups + row_group) * 768 + lane * 4;
+        let words = code_words[first_word..first_word + 644];
+        let first_input = sequence * 1024;
+        let inputs = activation_pairs[first_input..first_input + 1024];
+        var dots = [8]f32{};
+        six_group_batch(&weights, words, inputs, 0, &var dots);
+        six_group_batch(&weights, words, inputs, 1, &var dots);
+        six_group_batch(&weights, words, inputs, 2, &var dots);
+        six_group_batch(&weights, words, inputs, 3, &var dots);
+        six_group_batch(&weights, words, inputs, 4, &var dots);
+        six_group_batch(&weights, words, inputs, 5, &var dots);
+        six_group_batch(&weights, words, inputs, 6, &var dots);
+        six_group_batch(&weights, words, inputs, 7, &var dots);
+        totals[0] = totals[0] + block_weight_view[0] * cast<i64>(cast<i32>(dots[0]));
+        totals[1] = totals[1] + block_weight_view[1] * cast<i64>(cast<i32>(dots[1]));
+        totals[2] = totals[2] + block_weight_view[2] * cast<i64>(cast<i32>(dots[2]));
+        totals[3] = totals[3] + block_weight_view[3] * cast<i64>(cast<i32>(dots[3]));
+        totals[4] = totals[4] + block_weight_view[4] * cast<i64>(cast<i32>(dots[4]));
+        totals[5] = totals[5] + block_weight_view[5] * cast<i64>(cast<i32>(dots[5]));
+        totals[6] = totals[6] + block_weight_view[6] * cast<i64>(cast<i32>(dots[6]));
+        totals[7] = totals[7] + block_weight_view[7] * cast<i64>(cast<i32>(dots[7]));
+        sequence = sequence + 4;
+    }
+    store_batch_row_sums(row_sums, &var weights, &totals, batch, sum_stride);
+    return;
+}
+
+export "gpu" fn compressed_linear_row_sums_eight_batch(
+    code_words: []u32,
+    weight_pairs: []u16,
+    activation_pairs: []u32,
+    block_weights: []i64,
+    row_sums: &var []i64,
+    physical_rows: i64,
+    sequences: i64,
+    batch: i64,
+    sum_stride: i64
+) -> void {
+    var weight_storage = gpu::group_array<[4096]u32>();
+    var weights = weight_storage.as_mut_slice();
+    load_weights(weight_pairs, &var weights);
+    let lane = gpu::lane_index();
+    let row_group = gpu::group_index();
+    let row_groups = physical_rows / 32;
+    var totals = [8]i64{};
+    var sequence = gpu::simdgroup_index();
+    while sequence < sequences {
+        let first_block = cast<i64>(cast<u32>(sequence) >> 1) * batch_capacity();
+        let block_weight_view = block_weights[first_block..first_block + 8];
+        let first_word = (sequence * row_groups + row_group) * 1024 + lane * 4;
+        let words = code_words[first_word..first_word + 900];
+        let first_input = sequence * 1024;
+        let inputs = activation_pairs[first_input..first_input + 1024];
+        var dots = [8]f32{};
+        eight_word_batch(&weights, words, inputs, 0, &var dots);
+        eight_word_batch(&weights, words, inputs, 1, &var dots);
+        eight_word_batch(&weights, words, inputs, 2, &var dots);
+        eight_word_batch(&weights, words, inputs, 3, &var dots);
+        eight_word_batch(&weights, words, inputs, 4, &var dots);
+        eight_word_batch(&weights, words, inputs, 5, &var dots);
+        eight_word_batch(&weights, words, inputs, 6, &var dots);
+        eight_word_batch(&weights, words, inputs, 7, &var dots);
+        eight_word_batch(&weights, words, inputs, 8, &var dots);
+        eight_word_batch(&weights, words, inputs, 9, &var dots);
+        eight_word_batch(&weights, words, inputs, 10, &var dots);
+        eight_word_batch(&weights, words, inputs, 11, &var dots);
+        eight_word_batch(&weights, words, inputs, 12, &var dots);
+        eight_word_batch(&weights, words, inputs, 13, &var dots);
+        eight_word_batch(&weights, words, inputs, 14, &var dots);
+        eight_word_batch(&weights, words, inputs, 15, &var dots);
+        eight_word_batch(&weights, words, inputs, 16, &var dots);
+        eight_word_batch(&weights, words, inputs, 17, &var dots);
+        eight_word_batch(&weights, words, inputs, 18, &var dots);
+        eight_word_batch(&weights, words, inputs, 19, &var dots);
+        eight_word_batch(&weights, words, inputs, 20, &var dots);
+        eight_word_batch(&weights, words, inputs, 21, &var dots);
+        eight_word_batch(&weights, words, inputs, 22, &var dots);
+        eight_word_batch(&weights, words, inputs, 23, &var dots);
+        eight_word_batch(&weights, words, inputs, 24, &var dots);
+        eight_word_batch(&weights, words, inputs, 25, &var dots);
+        eight_word_batch(&weights, words, inputs, 26, &var dots);
+        eight_word_batch(&weights, words, inputs, 27, &var dots);
+        eight_word_batch(&weights, words, inputs, 28, &var dots);
+        eight_word_batch(&weights, words, inputs, 29, &var dots);
+        eight_word_batch(&weights, words, inputs, 30, &var dots);
+        eight_word_batch(&weights, words, inputs, 31, &var dots);
+        totals[0] = totals[0] + block_weight_view[0] * cast<i64>(cast<i32>(dots[0]));
+        totals[1] = totals[1] + block_weight_view[1] * cast<i64>(cast<i32>(dots[1]));
+        totals[2] = totals[2] + block_weight_view[2] * cast<i64>(cast<i32>(dots[2]));
+        totals[3] = totals[3] + block_weight_view[3] * cast<i64>(cast<i32>(dots[3]));
+        totals[4] = totals[4] + block_weight_view[4] * cast<i64>(cast<i32>(dots[4]));
+        totals[5] = totals[5] + block_weight_view[5] * cast<i64>(cast<i32>(dots[5]));
+        totals[6] = totals[6] + block_weight_view[6] * cast<i64>(cast<i32>(dots[6]));
+        totals[7] = totals[7] + block_weight_view[7] * cast<i64>(cast<i32>(dots[7]));
+        sequence = sequence + 4;
+    }
+    store_batch_row_sums(row_sums, &var weights, &totals, batch, sum_stride);
+    return;
+}
+
+fn eight_word_batch(weights: &[]u32, words: []u32, inputs: []u32, word: i64, dots: &var [8]f32) -> void {
+    var previous: u32 = 0;
+    if word > 0 {
+        previous = words[code_offset(word - 1)];
+    }
+    let current = words[code_offset(word)];
+    let at = word * 8;
+    step_batch(weights, inputs, at, (previous >> 28) | ((current & 0xff) << 4), dots);
+    step_batch(weights, inputs, at + 2, (current >> 4) & 0xfff, dots);
+    step_batch(weights, inputs, at + 4, (current >> 12) & 0xfff, dots);
+    step_batch(weights, inputs, at + 6, (current >> 20) & 0xfff, dots);
+    return;
+}
+
+fn six_group_batch(weights: &[]u32, words: []u32, inputs: []u32, group: i64, dots: &var [8]f32) -> void {
+    var previous: u32 = 0;
+    if group > 0 {
+        previous = words[code_offset(group * 3 - 1)];
+    }
+    let first = words[code_offset(group * 3)];
+    let second = words[code_offset(group * 3 + 1)];
+    let third = words[code_offset(group * 3 + 2)];
+    let at = group * 32;
+    step_batch(weights, inputs, at, (previous >> 26) | ((first & 0x3f) << 6), dots);
+    step_batch(weights, inputs, at + 2, first & 0xfff, dots);
+    step_batch(weights, inputs, at + 4, (first >> 6) & 0xfff, dots);
+    step_batch(weights, inputs, at + 6, (first >> 12) & 0xfff, dots);
+    step_batch(weights, inputs, at + 8, (first >> 18) & 0xfff, dots);
+    step_batch(weights, inputs, at + 10, (first >> 24) | ((second & 0xf) << 8), dots);
+    step_batch(weights, inputs, at + 12, (first >> 30) | ((second & 0x3ff) << 2), dots);
+    step_batch(weights, inputs, at + 14, (second >> 4) & 0xfff, dots);
+    step_batch(weights, inputs, at + 16, (second >> 10) & 0xfff, dots);
+    step_batch(weights, inputs, at + 18, (second >> 16) & 0xfff, dots);
+    step_batch(weights, inputs, at + 20, (second >> 22) | ((third & 0x3) << 10), dots);
+    step_batch(weights, inputs, at + 22, (second >> 28) | ((third & 0xff) << 4), dots);
+    step_batch(weights, inputs, at + 24, (third >> 2) & 0xfff, dots);
+    step_batch(weights, inputs, at + 26, (third >> 8) & 0xfff, dots);
+    step_batch(weights, inputs, at + 28, (third >> 14) & 0xfff, dots);
+    step_batch(weights, inputs, at + 30, (third >> 20) & 0xfff, dots);
+    return;
+}
+
+fn step_batch(weights: &[]u32, inputs: []u32, at: i64, state: u32, dots: &var [8]f32) -> void {
+    let weight_pair = weights[cast<i64>(state)];
+    let first = gpu::f32_from_half(cast<u16>(weight_pair & 0xffff));
+    let second = gpu::f32_from_half(cast<u16>(weight_pair >> 16));
+    let pair = at >> 1;
+    dots[0] = half_pair_dot(first, second, inputs[0 + pair], dots[0]);
+    dots[1] = half_pair_dot(first, second, inputs[128 + pair], dots[1]);
+    dots[2] = half_pair_dot(first, second, inputs[256 + pair], dots[2]);
+    dots[3] = half_pair_dot(first, second, inputs[384 + pair], dots[3]);
+    dots[4] = half_pair_dot(first, second, inputs[512 + pair], dots[4]);
+    dots[5] = half_pair_dot(first, second, inputs[640 + pair], dots[5]);
+    dots[6] = half_pair_dot(first, second, inputs[768 + pair], dots[6]);
+    dots[7] = half_pair_dot(first, second, inputs[896 + pair], dots[7]);
+    return;
+}
+
+fn half_pair_dot(first: f32, second: f32, packed: u32, dot: f32) -> f32 {
+    let low = gpu::f32_from_half(cast<u16>(packed & 0xffff));
+    let high = gpu::f32_from_half(cast<u16>(packed >> 16));
+    return gpu::fma(second, high, gpu::fma(first, low, dot));
+}
+
+fn store_batch_row_sums(row_sums: &var []i64, cells: &var []u32, totals: &[8]i64, batch: i64, sum_stride: i64) -> void {
+    let lane = gpu::lane_index();
+    let simdgroup = gpu::simdgroup_index();
+    gpu::barrier();
+    for 0..8 |token| {
+        let slot = ((token * 4 + simdgroup) * 32 + lane) * 2;
+        let bits = cast<u64>(totals[token]);
+        cells[slot] = cast<u32>(bits & 0xffffffff);
+        cells[slot + 1] = cast<u32>(bits >> 32);
+    }
+    gpu::barrier();
+    if simdgroup == 0 {
+        for 0..8 |token| {
+            if token < batch {
+                var total: i64 = 0;
+                for 0..4 |other| {
+                    let from = ((token * 4 + other) * 32 + lane) * 2;
+                    let value = cast<u64>(cells[from]) | (cast<u64>(cells[from + 1]) << 32);
+                    total = total + cast<i64>(value);
+                }
+                row_sums[token * sum_stride + gpu::group_index() * 32 + lane] = total;
+            }
+        }
+    }
+    return;
+}
